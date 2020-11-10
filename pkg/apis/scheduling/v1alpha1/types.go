@@ -154,7 +154,7 @@ type PodGroupStatus struct {
 	// It is empty if not initialized.
 	OccupiedBy string `json:"occupiedBy,omitempty"`
 
-	// The number of actively running pods.
+	// The number of scheduled finished pods.
 	// +optional
 	Scheduled int32 `json:"scheduled,omitempty"`
 

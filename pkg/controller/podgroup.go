@@ -222,16 +222,14 @@ func (ctrl *PodGroupController) syncHandler(ctx context.Context, pg *schedv1alph
 			succeeded int32 = 0
 			failed    int32 = 0
 		)
-		if len(pods) != 0 {
-			for _, pod := range pods {
-				switch pod.Status.Phase {
-				case v1.PodRunning:
-					running++
-				case v1.PodSucceeded:
-					succeeded++
-				case v1.PodFailed:
-					failed++
-				}
+		for _, pod := range pods {
+			switch pod.Status.Phase {
+			case v1.PodRunning:
+				running++
+			case v1.PodSucceeded:
+				succeeded++
+			case v1.PodFailed:
+				failed++
 			}
 		}
 		pgCopy.Status.Failed = failed
