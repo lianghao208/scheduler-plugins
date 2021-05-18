@@ -27,7 +27,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/events"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 
 	_ "sigs.k8s.io/scheduler-plugins/pkg/apis/config/scheme"
@@ -76,7 +76,7 @@ func TestLess(t *testing.T) {
 			ns:         "namespace2",
 		},
 	} {
-		pg := testutil.MakePG(pgInfo.pgNme, pgInfo.ns, 5, &pgInfo.createTime)
+		pg := testutil.MakePG(pgInfo.pgNme, pgInfo.ns, 5, &pgInfo.createTime, nil)
 		pgInformer.Informer().GetStore().Add(pg)
 	}
 
@@ -88,6 +88,7 @@ func TestLess(t *testing.T) {
 	existingPods, allNodes := testutil.MakeNodesAndPods(map[string]string{"test": "a"}, 60, 30)
 	snapshot := testutil.NewFakeSharedLister(existingPods, allNodes)
 	scheudleDuration := 10 * time.Second
+	deniedPGExpirationTime := 3 * time.Second
 	var lowPriority, highPriority = int32(10), int32(100)
 	ns1, ns2 := "namespace1", "namespace2"
 	for _, tt := range []struct {
@@ -255,7 +256,7 @@ func TestLess(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			pgMgr := core.NewPodGroupManager(cs, snapshot, &scheudleDuration, pgInformer, podInformer)
+			pgMgr := core.NewPodGroupManager(cs, snapshot, &scheudleDuration, &deniedPGExpirationTime, pgInformer, podInformer)
 			coscheduling := &Coscheduling{pgMgr: pgMgr}
 			if got := coscheduling.Less(tt.p1, tt.p2); got != tt.expected {
 				t.Errorf("expected %v, got %v", tt.expected, got)
@@ -291,8 +292,8 @@ func TestPermit(t *testing.T) {
 	pgInformerFactory := pgformers.NewSharedInformerFactory(cs, 0)
 	pgInformer := pgInformerFactory.Scheduling().V1alpha1().PodGroups()
 	pgInformerFactory.Start(ctx.Done())
-	pg1 := testutil.MakePG("pg1", "ns1", 2, nil)
-	pg2 := testutil.MakePG("pg2", "ns1", 1, nil)
+	pg1 := testutil.MakePG("pg1", "ns1", 2, nil, nil)
+	pg2 := testutil.MakePG("pg2", "ns1", 1, nil, nil)
 	pgInformer.Informer().GetStore().Add(pg1)
 	pgInformer.Informer().GetStore().Add(pg2)
 
@@ -303,9 +304,10 @@ func TestPermit(t *testing.T) {
 	existingPods, allNodes := testutil.MakeNodesAndPods(map[string]string{"test": "a"}, 60, 30)
 	snapshot := testutil.NewFakeSharedLister(existingPods, allNodes)
 	scheudleDuration := 10 * time.Second
+	deniedPGExpirationTime := 3 * time.Second
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pgMgr := core.NewPodGroupManager(cs, snapshot, &scheudleDuration, pgInformer, podInformer)
+			pgMgr := core.NewPodGroupManager(cs, snapshot, &scheudleDuration, &deniedPGExpirationTime, pgInformer, podInformer)
 			coscheduling := &Coscheduling{pgMgr: pgMgr, frameworkHandler: fakeHandler{}, scheduleTimeout: &scheudleDuration}
 			code, _ := coscheduling.Permit(context.Background(), framework.NewCycleState(), tt.pod, "test")
 			if code.Code() != tt.expected {
@@ -315,10 +317,93 @@ func TestPermit(t *testing.T) {
 	}
 }
 
+func TestPostFilter(t *testing.T) {
+	nodeStatusMap := framework.NodeToStatusMap{"node1": framework.NewStatus(framework.Success, "")}
+	ctx := context.Background()
+	cs := fakepgclientset.NewSimpleClientset()
+	pgInformerFactory := pgformers.NewSharedInformerFactory(cs, 0)
+	pgInformer := pgInformerFactory.Scheduling().V1alpha1().PodGroups()
+	pgInformerFactory.Start(ctx.Done())
+	pg := testutil.MakePG("pg", "ns1", 2, nil, nil)
+	pgInformer.Informer().GetStore().Add(pg)
+	fakeClient := clientsetfake.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+	podInformer := informerFactory.Core().V1().Pods()
+	informerFactory.Start(ctx.Done())
+
+	existingPods, allNodes := testutil.MakeNodesAndPods(map[string]string{"test": "a"}, 60, 30)
+	snapshot := testutil.NewFakeSharedLister(existingPods, allNodes)
+
+	existingPods, allNodes = testutil.MakeNodesAndPods(map[string]string{pgutil.PodGroupLabel: "pg"}, 10, 30)
+	for _, pod := range existingPods {
+		pod.Namespace = "ns1"
+	}
+	groupPodSnapshot := testutil.NewFakeSharedLister(existingPods, allNodes)
+	scheduleDuration := 10 * time.Second
+	deniedPGExpirationTime := 3 * time.Second
+	tests := []struct {
+		name                 string
+		pod                  *v1.Pod
+		expectedEmptyMsg     bool
+		preFilterSuccess     bool
+		snapshotSharedLister framework.SharedLister
+	}{
+		{
+			name:             "pod failed at pre-filter phase",
+			pod:              st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Obj(),
+			expectedEmptyMsg: true,
+			preFilterSuccess: false,
+		},
+		{
+			name:             "pod does not belong to any pod group",
+			pod:              st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Obj(),
+			expectedEmptyMsg: false,
+
+			preFilterSuccess: true,
+		},
+		{
+			name:                 "enough pods assigned, do not reject all",
+			pod:                  st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Label(pgutil.PodGroupLabel, "pg").Obj(),
+			expectedEmptyMsg:     true,
+			snapshotSharedLister: groupPodSnapshot,
+			preFilterSuccess:     true,
+		},
+		{
+			name:             "pod failed at filter phase, reject all pods",
+			pod:              st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Label(pgutil.PodGroupLabel, "pg").Obj(),
+			expectedEmptyMsg: false,
+			preFilterSuccess: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cycleState := framework.NewCycleState()
+			mgrSnapShot := snapshot
+			if tt.snapshotSharedLister != nil {
+				mgrSnapShot = tt.snapshotSharedLister
+			}
+
+			pgMgr := core.NewPodGroupManager(cs, mgrSnapShot, &scheduleDuration, &deniedPGExpirationTime, pgInformer, podInformer)
+			coscheduling := &Coscheduling{pgMgr: pgMgr, frameworkHandler: fakeHandler{}, scheduleTimeout: &scheduleDuration}
+			if !tt.preFilterSuccess {
+				cycleState.Write(coscheduling.getStateKey(), NewNoopStateData())
+			}
+			_, code := coscheduling.PostFilter(context.Background(), cycleState, tt.pod, nodeStatusMap)
+			if code.Message() == "" != tt.expectedEmptyMsg {
+				t.Errorf("expectedEmptyMsg %v, got %v", tt.expectedEmptyMsg, code.Message() == "")
+			}
+			if _, err := cycleState.Read(coscheduling.getStateKey()); err == nil {
+				t.Errorf("stateData leaking")
+			}
+		})
+	}
+}
+
 type fakeHandler struct {
 }
 
-var _ framework.FrameworkHandle = &fakeHandler{}
+var _ framework.Handle = &fakeHandler{}
 
 func (f fakeHandler) SnapshotSharedLister() framework.SharedLister {
 	return nil

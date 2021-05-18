@@ -257,10 +257,6 @@ API rule violation: list_type_missing,k8s.io/api/rbac/v1beta1,PolicyRule,Resourc
 API rule violation: list_type_missing,k8s.io/api/rbac/v1beta1,PolicyRule,Verbs
 API rule violation: list_type_missing,k8s.io/api/rbac/v1beta1,Role,Rules
 API rule violation: list_type_missing,k8s.io/api/rbac/v1beta1,RoleBinding,Subjects
-API rule violation: list_type_missing,k8s.io/api/settings/v1alpha1,PodPresetSpec,Env
-API rule violation: list_type_missing,k8s.io/api/settings/v1alpha1,PodPresetSpec,EnvFrom
-API rule violation: list_type_missing,k8s.io/api/settings/v1alpha1,PodPresetSpec,VolumeMounts
-API rule violation: list_type_missing,k8s.io/api/settings/v1alpha1,PodPresetSpec,Volumes
 API rule violation: list_type_missing,k8s.io/api/storage/v1,CSINodeDriver,TopologyKeys
 API rule violation: list_type_missing,k8s.io/api/storage/v1,CSINodeSpec,Drivers
 API rule violation: list_type_missing,k8s.io/api/storage/v1,StorageClass,AllowedTopologies
@@ -383,6 +379,8 @@ API rule violation: list_type_missing,k8s.io/kube-scheduler/config/v1,Policy,Pri
 API rule violation: list_type_missing,k8s.io/kube-scheduler/config/v1,RequestedToCapacityRatioArguments,Resources
 API rule violation: list_type_missing,k8s.io/kube-scheduler/config/v1,RequestedToCapacityRatioArguments,Shape
 API rule violation: list_type_missing,k8s.io/kube-scheduler/config/v1,ServiceAffinity,Labels
+API rule violation: list_type_missing,k8s.io/metrics/pkg/apis/metrics/v1alpha1,PodMetrics,Containers
+API rule violation: list_type_missing,k8s.io/metrics/pkg/apis/metrics/v1beta1,PodMetrics,Containers
 API rule violation: names_match,k8s.io/api/authorization/v1beta1,SubjectAccessReviewSpec,Groups
 API rule violation: names_match,k8s.io/api/core/v1,AzureDiskVolumeSource,DataDiskURI
 API rule violation: names_match,k8s.io/api/core/v1,ContainerStatus,LastTerminationState
@@ -460,4 +458,8 @@ API rule violation: names_match,k8s.io/apimachinery/pkg/runtime,Unknown,Raw
 API rule violation: names_match,k8s.io/apimachinery/pkg/util/intstr,IntOrString,IntVal
 API rule violation: names_match,k8s.io/apimachinery/pkg/util/intstr,IntOrString,StrVal
 API rule violation: names_match,k8s.io/apimachinery/pkg/util/intstr,IntOrString,Type
+API rule violation: names_match,k8s.io/client-go/pkg/apis/clientauthentication/v1beta1,Cluster,CertificateAuthorityData
+API rule violation: names_match,k8s.io/client-go/pkg/apis/clientauthentication/v1beta1,Cluster,InsecureSkipTLSVerify
+API rule violation: names_match,k8s.io/client-go/pkg/apis/clientauthentication/v1beta1,Cluster,ProxyURL
+API rule violation: names_match,k8s.io/client-go/pkg/apis/clientauthentication/v1beta1,Cluster,TLSServerName
 API rule violation: names_match,k8s.io/kube-scheduler/config/v1,LegacyExtender,EnableHTTPS

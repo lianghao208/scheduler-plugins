@@ -17,6 +17,7 @@ limitations under the License.
 package v1beta1
 
 import (
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	schedulerconfig "k8s.io/kube-scheduler/config/v1"
 )
@@ -29,23 +30,22 @@ type CoschedulingArgs struct {
 
 	// PermitWaitingTime is the wait timeout in seconds.
 	PermitWaitingTimeSeconds *int64 `json:"permitWaitingTimeSeconds,omitempty"`
-	// PodGroupGCInterval is the period to run gc of PodGroup in seconds.
-	PodGroupGCIntervalSeconds *int64 `json:"podGroupGCIntervalSeconds,omitempty"`
-	// If the deleted PodGroup stays longer than the PodGroupExpirationTime,
-	// the PodGroup will be deleted from PodGroupInfos.
-	PodGroupExpirationTimeSeconds *int64 `json:"podGroupExpirationTimeSeconds,omitempty"`
+	// DeniedPGExpirationTimeSeconds is the expiration time of the denied podgroup store.
+	DeniedPGExpirationTimeSeconds *int64 `json:"deniedPGExpirationTimeSeconds,omitempty"`
 	// KubeMaster is the url of api-server
-	KubeMaster string `json:"kubeMaster,omitempty"`
+	KubeMaster *string `json:"kubeMaster,omitempty"`
 	// KubeConfigPath for scheduler
-	KubeConfigPath string `json:"kubeConfigPath,omitempty"`
+	KubeConfigPath *string `json:"kubeConfigPath,omitempty"`
 }
 
-// modes type.
+// ModeType is a type "string".
 type ModeType string
 
 const (
+	// Least is the string "Least".
 	Least ModeType = "Least"
-	Most  ModeType = "Most"
+	// Most is the string "Most".
+	Most ModeType = "Most"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -72,5 +72,71 @@ type CapacitySchedulingArgs struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// KubeConfigPath is the path of kubeconfig.
-	KubeConfigPath *string `json:"kubeconfigpath,omitempty"`
+	KubeConfigPath *string `json:"kubeConfigPath,omitempty"`
+}
+
+// MetricProviderType is a "string" type.
+type MetricProviderType string
+
+const (
+	KubernetesMetricsServer MetricProviderType = "KubernetesMetricsServer"
+	Prometheus              MetricProviderType = "Prometheus"
+	SignalFx                MetricProviderType = "SignalFx"
+)
+
+// Denote the spec of the metric provider
+type MetricProviderSpec struct {
+	// Types of the metric provider
+	Type MetricProviderType `json:"type,omitempty"`
+	// The address of the metric provider
+	Address *string `json:"address,omitempty"`
+	// The authentication token of the metric provider
+	Token *string `json:"token,omitempty"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:defaulter-gen=true
+
+// TargetLoadPackingArgs holds arguments used to configure TargetLoadPacking plugin.
+type TargetLoadPackingArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// Default requests to use for best effort QoS
+	DefaultRequests v1.ResourceList `json:"defaultRequests,omitempty"`
+	// Default requests multiplier for busrtable QoS
+	DefaultRequestsMultiplier *string `json:"defaultRequestsMultiplier,omitempty"`
+	// Node target CPU Utilization for bin packing
+	TargetUtilization *int64 `json:"targetUtilization,omitempty"`
+	// Specify the metric provider type, address and token using MetricProviderSpec
+	MetricProvider MetricProviderSpec `json:"metricProvider,omitempty"`
+	// Address of load watcher service
+	WatcherAddress *string `json:"watcherAddress,omitempty"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +k8s:defaulter-gen=true
+
+// LoadVariationRiskBalancingArgs holds arguments used to configure LoadVariationRiskBalancing plugin.
+type LoadVariationRiskBalancingArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// Metric Provider specification when using load watcher as library
+	MetricProvider MetricProviderSpec `json:"metricProvider,omitempty"`
+	// Address of load watcher service
+	WatcherAddress *string `json:"watcherAddress,omitempty"`
+	// Multiplier of standard deviation in risk value
+	SafeVarianceMargin *float64 `json:"safeVarianceMargin,omitempty"`
+	// Root power of standard deviation in risk value
+	SafeVarianceSensitivity *float64 `json:"safeVarianceSensitivity,omitempty"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// NodeResourceTopologyMatchArgs holds arguments used to configure the NodeResourceTopologyMatch plugin
+type NodeResourceTopologyMatchArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	KubeConfigPath *string  `json:"kubeconfigpath,omitempty"`
+	MasterOverride *string  `json:"masteroverride,omitempty"`
+	Namespaces     []string `json:"namespaces,omitempty"`
 }

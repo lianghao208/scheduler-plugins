@@ -29,9 +29,9 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
-	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"sigs.k8s.io/scheduler-plugins/pkg/apis/config"
 	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling/core"
@@ -42,13 +42,14 @@ import (
 
 // Coscheduling is a plugin that schedules pods in a group.
 type Coscheduling struct {
-	frameworkHandler framework.FrameworkHandle
+	frameworkHandler framework.Handle
 	pgMgr            core.Manager
 	scheduleTimeout  *time.Duration
 }
 
 var _ framework.QueueSortPlugin = &Coscheduling{}
 var _ framework.PreFilterPlugin = &Coscheduling{}
+var _ framework.PostFilterPlugin = &Coscheduling{}
 var _ framework.PermitPlugin = &Coscheduling{}
 var _ framework.ReservePlugin = &Coscheduling{}
 var _ framework.PostBindPlugin = &Coscheduling{}
@@ -58,12 +59,13 @@ const (
 	Name = "Coscheduling"
 )
 
-// New initializes a new plugin and returns it.
-func New(obj runtime.Object, handle framework.FrameworkHandle) (framework.Plugin, error) {
+// New initializes and returns a new Coscheduling plugin.
+func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {
 	args, ok := obj.(*config.CoschedulingArgs)
 	if !ok {
 		return nil, fmt.Errorf("want args to be of type CoschedulingArgs, got %T", obj)
 	}
+
 	conf, err := clientcmd.BuildConfigFromFlags(args.KubeMaster, args.KubeConfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init rest.Config: %v", err)
@@ -82,15 +84,12 @@ func New(obj runtime.Object, handle framework.FrameworkHandle) (framework.Plugin
 	}))
 	podInformer := informerFactory.Core().V1().Pods()
 
-	var (
-		scheduleTimeDuration = util.DefaultWaitTime
-	)
-	if args.PermitWaitingTimeSeconds != 0 {
-		scheduleTimeDuration = time.Duration(args.PermitWaitingTimeSeconds) * time.Second
-	}
+	scheduleTimeDuration := time.Duration(args.PermitWaitingTimeSeconds) * time.Second
+	deniedPGExpirationTime := time.Duration(args.DeniedPGExpirationTimeSeconds) * time.Second
+
 	ctx := context.TODO()
 
-	pgMgr := core.NewPodGroupManager(pgClient, handle.SnapshotSharedLister(), &scheduleTimeDuration, pgInformer, podInformer)
+	pgMgr := core.NewPodGroupManager(pgClient, handle.SnapshotSharedLister(), &scheduleTimeDuration, &deniedPGExpirationTime, pgInformer, podInformer)
 	plugin := &Coscheduling{
 		frameworkHandler: handle,
 		pgMgr:            pgMgr,
@@ -115,8 +114,8 @@ func (cs *Coscheduling) Name() string {
 // 2. Compare the initialization timestamps of PodGroups or Pods.
 // 3. Compare the keys of PodGroups/Pods: <namespace>/<podname>.
 func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
-	prio1 := podutil.GetPodPriority(podInfo1.Pod)
-	prio2 := podutil.GetPodPriority(podInfo2.Pod)
+	prio1 := corev1helpers.PodPriority(podInfo1.Pod)
+	prio2 := corev1helpers.PodPriority(podInfo2.Pod)
 	if prio1 != prio2 {
 		return prio1 > prio2
 	}
@@ -132,11 +131,60 @@ func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
 // 1. Whether the PodGroup that the Pod belongs to is on the deny list.
 // 2. Whether the total number of pods in a PodGroup is less than its `minMember`.
 func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) *framework.Status {
+	// If any validation failed, a no-op state data is injected to "state" so that in later
+	// phases we can tell whether the failure comes from PreFilter or not.
 	if err := cs.pgMgr.PreFilter(ctx, pod); err != nil {
 		klog.Error(err)
+		state.Write(cs.getStateKey(), NewNoopStateData())
 		return framework.NewStatus(framework.Unschedulable, err.Error())
 	}
 	return framework.NewStatus(framework.Success, "")
+}
+
+// PostFilter is used to rejecting a group of pods if a pod does not pass PreFilter or Filter.
+func (cs *Coscheduling) PostFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod,
+	filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	// Check if the failure comes from PreFilter or not.
+	_, err := state.Read(cs.getStateKey())
+	if err == nil {
+		state.Delete(cs.getStateKey())
+		return &framework.PostFilterResult{}, framework.NewStatus(framework.Unschedulable)
+	}
+
+	pgName, pg := cs.pgMgr.GetPodGroup(pod)
+	if pg == nil {
+		klog.V(4).Info("Pod does not belong to any group")
+		return &framework.PostFilterResult{}, framework.NewStatus(framework.Unschedulable, "can not find pod group")
+	}
+
+	// This indicates there are already enough Pods satisfying the PodGroup,
+	// so don't bother to reject the whole PodGroup.
+	assigned := cs.pgMgr.CalculateAssignedPods(pg.Name, pod.Namespace)
+	if assigned >= int(pg.Spec.MinMember) {
+		klog.V(4).Infof("%v pods of %v assigned", assigned, pgName)
+		return &framework.PostFilterResult{}, framework.NewStatus(framework.Unschedulable)
+	}
+
+	// If the gap is less than/equal 10%, we may want to try subsequent Pods
+	// to see they can satisfy the PodGroup
+	notAssiginedPercentage := float32(int(pg.Spec.MinMember)-assigned) / float32(pg.Spec.MinMember)
+	if notAssiginedPercentage <= 0.1 {
+		klog.V(4).Infof("%.2f/100 pods of group %v have not assigned", float32(assigned*100), pgName)
+		return &framework.PostFilterResult{}, framework.NewStatus(framework.Unschedulable)
+	}
+
+	// It's based on an implicit assumption: if the nth Pod failed,
+	// it's inferrable other Pods belonging to the same PodGroup would be very likely to fail.
+	cs.frameworkHandler.IterateOverWaitingPods(func(waitingPod framework.WaitingPod) {
+		if waitingPod.GetPod().Namespace == pod.Namespace && waitingPod.GetPod().Labels[util.PodGroupLabel] == pg.Name {
+			klog.V(3).Infof("PostFilter rejects the pod: %v/%v", pgName, waitingPod.GetPod().Name)
+			waitingPod.Reject(cs.Name())
+		}
+	})
+	cs.pgMgr.AddDeniedPodGroup(pgName)
+	cs.pgMgr.DeletePermittedPodGroup(pgName)
+	return &framework.PostFilterResult{}, framework.NewStatus(framework.Unschedulable,
+		fmt.Sprintf("PodGroup %v gets rejected due to Pod %v is unschedulable even after PostFilter", pgName, pod.Name))
 }
 
 // PreFilterExtensions returns a PreFilterExtensions interface if the plugin implements one.
@@ -201,6 +249,7 @@ func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleSta
 		}
 	})
 	cs.pgMgr.AddDeniedPodGroup(pgName)
+	cs.pgMgr.DeletePermittedPodGroup(pgName)
 }
 
 // PostBind is called after a pod is successfully bound. These plugins are used update PodGroup when pod is bound.
@@ -216,4 +265,19 @@ func (cs *Coscheduling) rejectPod(uid types.UID) {
 		return
 	}
 	waitingPod.Reject(Name)
+}
+
+func (cs *Coscheduling) getStateKey() framework.StateKey {
+	return framework.StateKey(fmt.Sprintf("Prefilter-%v", cs.Name()))
+}
+
+type noopStateData struct {
+}
+
+func NewNoopStateData() framework.StateData {
+	return &noopStateData{}
+}
+
+func (d *noopStateData) Clone() framework.StateData {
+	return d
 }

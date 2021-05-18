@@ -14,16 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// +k8s:defaulter-gen=true
+
 package v1beta1
 
 import (
+	"strconv"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	schedulerconfig "k8s.io/kube-scheduler/config/v1"
+
+	pluginConfig "sigs.k8s.io/scheduler-plugins/pkg/apis/config"
 )
 
 var (
-	defaultPermitWaitingTimeSeconds      int64 = 10
-	defaultPodGroupGCIntervalSeconds     int64 = 30
-	defaultPodGroupExpirationTimeSeconds int64 = 600
+	defaultPermitWaitingTimeSeconds      int64 = 60
+	defaultDeniedPGExpirationTimeSeconds int64 = 20
 
 	defaultNodeResourcesAllocatableMode = Least
 
@@ -36,22 +44,46 @@ var (
 		{Name: "cpu", Weight: 1 << 20}, {Name: "memory", Weight: 1},
 	}
 
+	// Defaults for TargetLoadPacking plugin
+
+	// Default 1 core CPU usage for containers without requests and limits i.e. Best Effort QoS.
+	DefaultRequestsMilliCores int64 = 1000
+	// DefaultRequestsMultiplier for containers without limits predicted as 1.5*requests i.e. Burstable QoS class
+	DefaultRequestsMultiplier = "1.5"
+	// DefaultTargetUtilizationPercent Recommended to keep -10 than desired limit.
+	DefaultTargetUtilizationPercent int64 = 40
+
+	// Defaults for LoadVariationRiskBalancing plugin
+
+	// Risk is usually calculated as average (aka. mu) plus standard deviation (aka. sigma).
+	// In order to allow customization in the calculation of risk, two parameters are provided:
+	// Margin and Sensitivity. Margin is a multiplier of sigma, and Sensitivity is a root power of sigma.
+	// For example, Margin=3 and Sensitivity=2 leads to a risk evaluated as: mu + 3 sqrt(sigma).
+	// The default value for both parameters is 1, leading to: mu + sigma.
+	// DefaultSafeVarianceMargin is one
+	DefaultSafeVarianceMargin = 1.0
+	// DefaultSafeVarianceSensitivity is one
+	DefaultSafeVarianceSensitivity = 1.0
+	// DefaultMetricProviderType is the Kubernetes metrics server
+	DefaultMetricProviderType = pluginConfig.KubernetesMetricsServer
+
 	defaultKubeConfigPath string = "/etc/kubernetes/scheduler.conf"
 )
 
-func SetDefaults_CoschedulingArgs(obj *CoschedulingArgs) {
+// SetDefaultsCoschedulingArgs sets the default parameters for Coscheduling plugin.
+func SetDefaultsCoschedulingArgs(obj *CoschedulingArgs) {
 	if obj.PermitWaitingTimeSeconds == nil {
 		obj.PermitWaitingTimeSeconds = &defaultPermitWaitingTimeSeconds
 	}
-	if obj.PodGroupGCIntervalSeconds == nil {
-		obj.PodGroupGCIntervalSeconds = &defaultPodGroupGCIntervalSeconds
+	if obj.DeniedPGExpirationTimeSeconds == nil {
+		obj.DeniedPGExpirationTimeSeconds = &defaultDeniedPGExpirationTimeSeconds
 	}
-	if obj.PodGroupExpirationTimeSeconds == nil {
-		obj.PodGroupExpirationTimeSeconds = &defaultPodGroupExpirationTimeSeconds
-	}
+
+	// TODO(k/k#96427): get KubeConfigPath and KubeMaster from configuration or command args.
 }
 
-func SetDefaults_NodeResourcesAllocatableArgs(obj *NodeResourcesAllocatableArgs) {
+// SetDefaultsNodeResourcesAllocatableArgs sets the defaults parameters for NodeResourceAllocatable.
+func SetDefaultsNodeResourcesAllocatableArgs(obj *NodeResourcesAllocatableArgs) {
 	if len(obj.Resources) == 0 {
 		obj.Resources = defaultNodeResourcesAllocatableResourcesToWeightMap
 	}
@@ -61,8 +93,50 @@ func SetDefaults_NodeResourcesAllocatableArgs(obj *NodeResourcesAllocatableArgs)
 	}
 }
 
-func SetDefaults_CapacitySchedulingArgs(obj *CapacitySchedulingArgs) {
+// SetDefaultsCapacitySchedulingArgs sets the default parameters for CapacityScheduling plugin.
+func SetDefaultsCapacitySchedulingArgs(obj *CapacitySchedulingArgs) {
 	if obj.KubeConfigPath == nil {
 		obj.KubeConfigPath = &defaultKubeConfigPath
+	}
+}
+
+// SetDefaultTargetLoadPackingArgs sets the default parameters for TargetLoadPacking plugin
+func SetDefaultTargetLoadPackingArgs(args *TargetLoadPackingArgs) {
+	if args.DefaultRequests == nil {
+		args.DefaultRequests = v1.ResourceList{v1.ResourceCPU: resource.MustParse(
+			strconv.FormatInt(DefaultRequestsMilliCores, 10) + "m")}
+	}
+	if args.DefaultRequestsMultiplier == nil {
+		args.DefaultRequestsMultiplier = &DefaultRequestsMultiplier
+	}
+	if args.TargetUtilization == nil || *args.TargetUtilization <= 0 {
+		args.TargetUtilization = &DefaultTargetUtilizationPercent
+	}
+}
+
+// SetDefaultLoadVariationRiskBalancingArgs sets the default parameters for LoadVariationRiskBalancing plugin
+func SetDefaultLoadVariationRiskBalancingArgs(args *LoadVariationRiskBalancingArgs) {
+	metricProviderType := string(args.MetricProvider.Type)
+	validMetricProviderType := metricProviderType == string(pluginConfig.KubernetesMetricsServer) ||
+		metricProviderType == string(pluginConfig.Prometheus) ||
+		metricProviderType == string(pluginConfig.SignalFx)
+	if args.WatcherAddress == nil && !validMetricProviderType {
+		args.MetricProvider.Type = MetricProviderType(DefaultMetricProviderType)
+	}
+	if args.SafeVarianceMargin == nil || *args.SafeVarianceMargin < 0 {
+		args.SafeVarianceMargin = &DefaultSafeVarianceMargin
+	}
+	if args.SafeVarianceSensitivity == nil || *args.SafeVarianceSensitivity < 0 {
+		args.SafeVarianceSensitivity = &DefaultSafeVarianceSensitivity
+	}
+}
+
+// SetDefaultsNodeResourceTopologyMatchArgs sets the default parameters for NodeResourceTopologyMatch plugin.
+func SetDefaultsNodeResourceTopologyMatchArgs(obj *NodeResourceTopologyMatchArgs) {
+	if obj.KubeConfigPath == nil {
+		obj.KubeConfigPath = &defaultKubeConfigPath
+	}
+	if len(obj.Namespaces) == 0 {
+		obj.Namespaces = []string{metav1.NamespaceDefault}
 	}
 }
