@@ -83,8 +83,6 @@ func SetDefaultsCoschedulingArgs(obj *CoschedulingArgs) {
 	if obj.DeniedPGExpirationTimeSeconds == nil {
 		obj.DeniedPGExpirationTimeSeconds = &defaultDeniedPGExpirationTimeSeconds
 	}
-
-	// TODO(k/k#96427): get KubeConfigPath and KubeMaster from configuration or command args.
 }
 
 // SetDefaultsNodeResourcesAllocatableArgs sets the defaults parameters for NodeResourceAllocatable.
@@ -96,11 +94,6 @@ func SetDefaultsNodeResourcesAllocatableArgs(obj *NodeResourcesAllocatableArgs) 
 	if obj.Mode == "" {
 		obj.Mode = defaultNodeResourcesAllocatableMode
 	}
-}
-
-// SetDefaultsCapacitySchedulingArgs sets the default parameters for CapacityScheduling plugin.
-func SetDefaultsCapacitySchedulingArgs(obj *CapacitySchedulingArgs) {
-	// TODO(k/k#96427): get KubeConfigPath and KubeMaster from configuration or command args.
 }
 
 // SetDefaultTargetLoadPackingArgs sets the default parameters for TargetLoadPacking plugin
@@ -115,15 +108,14 @@ func SetDefaultTargetLoadPackingArgs(args *TargetLoadPackingArgs) {
 	if args.TargetUtilization == nil || *args.TargetUtilization <= 0 {
 		args.TargetUtilization = &DefaultTargetUtilizationPercent
 	}
+	if args.WatcherAddress == nil && args.MetricProvider.Type == "" {
+		args.MetricProvider.Type = MetricProviderType(DefaultMetricProviderType)
+	}
 }
 
 // SetDefaultLoadVariationRiskBalancingArgs sets the default parameters for LoadVariationRiskBalancing plugin
 func SetDefaultLoadVariationRiskBalancingArgs(args *LoadVariationRiskBalancingArgs) {
-	metricProviderType := string(args.MetricProvider.Type)
-	validMetricProviderType := metricProviderType == string(pluginConfig.KubernetesMetricsServer) ||
-		metricProviderType == string(pluginConfig.Prometheus) ||
-		metricProviderType == string(pluginConfig.SignalFx)
-	if args.WatcherAddress == nil && !validMetricProviderType {
+	if args.WatcherAddress == nil && args.MetricProvider.Type == "" {
 		args.MetricProvider.Type = MetricProviderType(DefaultMetricProviderType)
 	}
 	if args.SafeVarianceMargin == nil || *args.SafeVarianceMargin < 0 {
