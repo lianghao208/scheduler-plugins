@@ -22,11 +22,11 @@ import (
 	"sigs.k8s.io/scheduler-plugins/apis/scheduling"
 )
 
+// ElasticQuota sets elastic quota restrictions per namespace
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:shortName={eq,eqs}
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// ElasticQuota sets elastic quota restrictions per namespace
+// +kubebuilder:subresource:status
 type ElasticQuota struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -113,11 +113,11 @@ const (
 	PodGroupLabel = "pod-group." + scheduling.GroupName
 )
 
+// PodGroup is a collection of Pod; used for batch workload.
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:shortName={pg,pgs}
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// PodGroup is a collection of Pod; used for batch workload.
+// +kubebuilder:subresource:status
 type PodGroup struct {
 	metav1.TypeMeta `json:",inline"`
 	// Standard object's metadata.
@@ -144,7 +144,7 @@ type PodGroupSpec struct {
 	// MinResources defines the minimal resource of members/tasks to run the pod group;
 	// if there's not enough resources to start all tasks, the scheduler
 	// will not start anyone.
-	MinResources *v1.ResourceList `json:"minResources,omitempty"`
+	MinResources v1.ResourceList `json:"minResources,omitempty"`
 
 	// ScheduleTimeoutSeconds defines the maximal time of members/tasks to wait before run the pod group;
 	ScheduleTimeoutSeconds *int32 `json:"scheduleTimeoutSeconds,omitempty"`
