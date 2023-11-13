@@ -23,7 +23,6 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,13 +39,17 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 
 	agv1alpha1 "github.com/diktyo-io/appgroup-api/pkg/apis/appgroup/v1alpha1"
-	agversioned "github.com/diktyo-io/appgroup-api/pkg/generated/clientset/versioned"
 	ntv1alpha1 "github.com/diktyo-io/networktopology-api/pkg/apis/networktopology/v1alpha1"
-	ntversioned "github.com/diktyo-io/networktopology-api/pkg/generated/clientset/versioned"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+
 	"sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 )
 
 var lowPriority, midPriority, highPriority = int32(0), int32(100), int32(1000)
+
+var signalHandler = ctrl.SetupSignalHandler()
 
 // podScheduled returns true if a node is assigned to the given pod.
 func podScheduled(c clientset.Interface, podNamespace, podName string) bool {
@@ -132,7 +135,6 @@ type eqWrapper struct{ *v1alpha1.ElasticQuota }
 
 func MakeEQ(namespace, name string) *eqWrapper {
 	eq := &v1alpha1.ElasticQuota{
-		TypeMeta: metav1.TypeMeta{Kind: "ElasticQuota", APIVersion: "scheduling.sigs.k8s.io/v1alpha1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
@@ -196,8 +198,7 @@ func initTestSchedulerWithOptions(t *testing.T, testCtx *testContext, opts ...sc
 		t.Fatalf("Couldn't create scheduler: %v", err)
 	}
 
-	stopCh := make(chan struct{})
-	eventBroadcaster.StartRecordingToSink(stopCh)
+	eventBroadcaster.StartRecordingToSink(testCtx.Ctx.Done())
 
 	return testCtx
 }
@@ -259,35 +260,35 @@ func createNamespace(t *testing.T, testCtx *testContext, ns string) {
 	}
 }
 
-func createAppGroups(ctx context.Context, client agversioned.Interface, appGroups []*agv1alpha1.AppGroup) error {
+func createAppGroups(ctx context.Context, client ctrlclient.Client, appGroups []*agv1alpha1.AppGroup) error {
 	for _, ag := range appGroups {
-		_, err := client.AppgroupV1alpha1().AppGroups(ag.Namespace).Create(ctx, ag, metav1.CreateOptions{})
-		if err != nil && !errors.IsAlreadyExists(err) {
+		err := client.Create(ctx, ag.DeepCopy())
+		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return err
 		}
 	}
 	return nil
 }
 
-func cleanupAppGroups(ctx context.Context, client agversioned.Interface, appGroups []*agv1alpha1.AppGroup) {
+func cleanupAppGroups(ctx context.Context, client ctrlclient.Client, appGroups []*agv1alpha1.AppGroup) {
 	for _, ag := range appGroups {
-		client.AppgroupV1alpha1().AppGroups(ag.Namespace).Delete(ctx, ag.Name, metav1.DeleteOptions{})
+		client.Delete(ctx, ag)
 	}
 }
 
-func createNetworkTopologies(ctx context.Context, client ntversioned.Interface, networkTopologies []*ntv1alpha1.NetworkTopology) error {
+func createNetworkTopologies(ctx context.Context, client ctrlclient.Client, networkTopologies []*ntv1alpha1.NetworkTopology) error {
 	for _, nt := range networkTopologies {
-		_, err := client.NetworktopologyV1alpha1().NetworkTopologies(nt.Namespace).Create(ctx, nt, metav1.CreateOptions{})
-		if err != nil && !errors.IsAlreadyExists(err) {
+		err := client.Create(ctx, nt.DeepCopy())
+		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return err
 		}
 	}
 	return nil
 }
 
-func cleanupNetworkTopologies(ctx context.Context, client ntversioned.Interface, networkTopologies []*ntv1alpha1.NetworkTopology) {
+func cleanupNetworkTopologies(ctx context.Context, client ctrlclient.Client, networkTopologies []*ntv1alpha1.NetworkTopology) {
 	for _, nt := range networkTopologies {
-		client.NetworktopologyV1alpha1().NetworkTopologies(nt.Namespace).Delete(ctx, nt.Name, metav1.DeleteOptions{})
+		client.Delete(ctx, nt)
 	}
 }
 
@@ -296,7 +297,6 @@ type agWrapper struct{ *agv1alpha1.AppGroup }
 
 func MakeAppGroup(namespace, name string) *agWrapper {
 	ag := &agv1alpha1.AppGroup{
-		TypeMeta: metav1.TypeMeta{Kind: "AppGroup", APIVersion: "appgroup.diktyo.io/v1alpha1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
@@ -334,7 +334,6 @@ type ntWrapper struct{ *ntv1alpha1.NetworkTopology }
 
 func MakeNetworkTopology(namespace, name string) *ntWrapper {
 	nt := &ntv1alpha1.NetworkTopology{
-		TypeMeta: metav1.TypeMeta{Kind: "NetworkTopology", APIVersion: "networktopology.diktyo.io/v1alpha1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,

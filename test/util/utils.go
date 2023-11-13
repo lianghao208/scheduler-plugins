@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
@@ -85,6 +86,17 @@ func MakePG(name, namespace string, min int32, creationTime *time.Time, minResou
 	}
 	if minResource != nil {
 		pg.Spec.MinResources = *minResource
+	}
+	return pg
+}
+
+func UpdatePGStatus(pg *v1alpha1.PodGroup, phase v1alpha1.PodGroupPhase, occupiedBy string, scheduled int32, running int32, succeeded int32, failed int32) *v1alpha1.PodGroup {
+	pg.Status = v1alpha1.PodGroupStatus{
+		Phase:      phase,
+		OccupiedBy: occupiedBy,
+		Running:    running,
+		Succeeded:  succeeded,
+		Failed:     failed,
 	}
 	return pg
 }
@@ -159,4 +171,13 @@ func makeResListMap(resMap map[string]string) corev1.ResourceList {
 		res[corev1.ResourceName(k)] = resource.MustParse(v)
 	}
 	return res
+}
+
+func MustNewPodInfo(t testing.TB, pod *corev1.Pod) *framework.PodInfo {
+	podInfo, err := framework.NewPodInfo(pod)
+	if err != nil {
+		t.Fatalf("expected err to be nil got: %v", err)
+	}
+
+	return podInfo
 }

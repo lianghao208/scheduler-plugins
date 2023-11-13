@@ -18,6 +18,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -26,26 +27,27 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 
 	scheconfig "sigs.k8s.io/scheduler-plugins/apis/config"
+	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/stringify"
 
-	topologyv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
+	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned"
 )
 
 const (
 	cpu             = string(corev1.ResourceCPU)
 	memory          = string(corev1.ResourceMemory)
+	gpuResourceName = "vendor/gpu"
 	hugepages2Mi    = "hugepages-2Mi"
 	nicResourceName = "vendor/nic1"
 )
 
-func waitForNRT(cs *kubernetes.Clientset) error {
+func waitForNRT(cs *clientset.Clientset) error {
 	return wait.Poll(100*time.Millisecond, 3*time.Second, func() (done bool, err error) {
 		groupList, _, err := cs.ServerGroupsAndResources()
 		if err != nil {
@@ -61,7 +63,7 @@ func waitForNRT(cs *kubernetes.Clientset) error {
 	})
 }
 
-func createNodesFromNodeResourceTopologies(cs clientset.Interface, ctx context.Context, nodeResourceTopologies []*topologyv1alpha1.NodeResourceTopology) error {
+func createNodesFromNodeResourceTopologies(cs clientset.Interface, ctx context.Context, nodeResourceTopologies []*topologyv1alpha2.NodeResourceTopology) error {
 	for _, nrt := range nodeResourceTopologies {
 		nodeName := nrt.Name
 		resMap := toResMap(accumulateResourcesToCapacity(*nrt))
@@ -89,9 +91,9 @@ func getNodeName(ctx context.Context, c clientset.Interface, podNamespace, podNa
 	return pod.Spec.NodeName, nil
 }
 
-func createNodeResourceTopologies(ctx context.Context, topologyClient *versioned.Clientset, noderesourcetopologies []*topologyv1alpha1.NodeResourceTopology) error {
+func createNodeResourceTopologies(ctx context.Context, topologyClient *versioned.Clientset, noderesourcetopologies []*topologyv1alpha2.NodeResourceTopology) error {
 	for _, nrt := range noderesourcetopologies {
-		_, err := topologyClient.TopologyV1alpha1().NodeResourceTopologies().Create(ctx, nrt, metav1.CreateOptions{})
+		_, err := topologyClient.TopologyV1alpha2().NodeResourceTopologies().Create(ctx, nrt, metav1.CreateOptions{})
 		if err != nil {
 			return err
 		}
@@ -99,14 +101,41 @@ func createNodeResourceTopologies(ctx context.Context, topologyClient *versioned
 	return nil
 }
 
-func cleanupNodeResourceTopologies(ctx context.Context, topologyClient *versioned.Clientset, noderesourcetopologies []*topologyv1alpha1.NodeResourceTopology) {
+func updateNodeResourceTopologies(ctx context.Context, topologyClient *versioned.Clientset, noderesourcetopologies []*topologyv1alpha2.NodeResourceTopology) error {
 	for _, nrt := range noderesourcetopologies {
-		err := topologyClient.TopologyV1alpha1().NodeResourceTopologies().Delete(ctx, nrt.Name, metav1.DeleteOptions{})
+		updatedNrt, err := topologyClient.TopologyV1alpha2().NodeResourceTopologies().Get(ctx, nrt.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		obj := updatedNrt.DeepCopy()
+		if obj.Annotations == nil {
+			obj.Annotations = make(map[string]string)
+		}
+		for key, value := range nrt.Annotations {
+			obj.Annotations[key] = value
+		}
+
+		obj.TopologyPolicies = nrt.TopologyPolicies // TODO: Deprecated; shallow copy
+		obj.Attributes = nrt.Attributes.DeepCopy()
+		obj.Zones = nrt.Zones.DeepCopy()
+
+		_, err = topologyClient.TopologyV1alpha2().NodeResourceTopologies().Update(ctx, obj, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupNodeResourceTopologies(ctx context.Context, topologyClient *versioned.Clientset, noderesourcetopologies []*topologyv1alpha2.NodeResourceTopology) {
+	for _, nrt := range noderesourcetopologies {
+		err := topologyClient.TopologyV1alpha2().NodeResourceTopologies().Delete(ctx, nrt.Name, metav1.DeleteOptions{})
 		if err != nil {
 			klog.ErrorS(err, "Failed to clean up NodeResourceTopology", "nodeResourceTopology", nrt)
 		}
 	}
-	klog.Infof("init scheduler success")
+	klog.Infof("cleaned up NRT %d objects", len(noderesourcetopologies))
 }
 
 func makeResourceAllocationScoreArgs(strategy *scheconfig.ScoringStrategy) *scheconfig.NodeResourceTopologyMatchArgs {
@@ -116,11 +145,11 @@ func makeResourceAllocationScoreArgs(strategy *scheconfig.ScoringStrategy) *sche
 }
 
 type nrtWrapper struct {
-	nrt topologyv1alpha1.NodeResourceTopology
+	nrt topologyv1alpha2.NodeResourceTopology
 }
 
 func MakeNRT() *nrtWrapper {
-	return &nrtWrapper{topologyv1alpha1.NodeResourceTopology{}}
+	return &nrtWrapper{topologyv1alpha2.NodeResourceTopology{}}
 }
 
 func (n *nrtWrapper) Name(name string) *nrtWrapper {
@@ -128,13 +157,13 @@ func (n *nrtWrapper) Name(name string) *nrtWrapper {
 	return n
 }
 
-func (n *nrtWrapper) Policy(policy topologyv1alpha1.TopologyManagerPolicy) *nrtWrapper {
+func (n *nrtWrapper) Policy(policy topologyv1alpha2.TopologyManagerPolicy) *nrtWrapper {
 	n.nrt.TopologyPolicies = append(n.nrt.TopologyPolicies, string(policy))
 	return n
 }
 
-func (n *nrtWrapper) Zone(resInfo topologyv1alpha1.ResourceInfoList) *nrtWrapper {
-	z := topologyv1alpha1.Zone{
+func (n *nrtWrapper) Zone(resInfo topologyv1alpha2.ResourceInfoList) *nrtWrapper {
+	z := topologyv1alpha2.Zone{
 		Name:      fmt.Sprintf("node-%d", len(n.nrt.Zones)),
 		Type:      "Node",
 		Resources: resInfo,
@@ -143,38 +172,68 @@ func (n *nrtWrapper) Zone(resInfo topologyv1alpha1.ResourceInfoList) *nrtWrapper
 	return n
 }
 
-func (n *nrtWrapper) Obj() *topologyv1alpha1.NodeResourceTopology {
+func (n *nrtWrapper) ZoneWithCosts(resInfo topologyv1alpha2.ResourceInfoList, costs topologyv1alpha2.CostList) *nrtWrapper {
+	z := topologyv1alpha2.Zone{
+		Name:      fmt.Sprintf("node-%d", len(n.nrt.Zones)),
+		Type:      "Node",
+		Resources: resInfo,
+		Costs:     costs,
+	}
+	n.nrt.Zones = append(n.nrt.Zones, z)
+	return n
+}
+
+func (n *nrtWrapper) Annotations(anns map[string]string) *nrtWrapper {
+	if n.nrt.Annotations == nil {
+		n.nrt.Annotations = make(map[string]string)
+	}
+	for key, val := range anns {
+		n.nrt.Annotations[key] = val
+	}
+	return n
+}
+
+func (n *nrtWrapper) Attributes(attrs topologyv1alpha2.AttributeList) *nrtWrapper {
+	n.nrt.Attributes = append(n.nrt.Attributes, attrs...)
+	return n
+}
+
+func (n *nrtWrapper) Obj() *topologyv1alpha2.NodeResourceTopology {
 	return &n.nrt
 }
 
-func podIsScheduled(interval time.Duration, times int, cs clientset.Interface, podNamespace, podName string) error {
-	return wait.Poll(interval, time.Duration(times)*interval, func() (bool, error) {
-		return podScheduled(cs, podNamespace, podName), nil
+func podIsScheduled(interval time.Duration, times int, cs clientset.Interface, podNamespace, podName string) (*corev1.Pod, error) {
+	var err error
+	var pod *corev1.Pod
+	waitErr := wait.Poll(interval, time.Duration(times)*interval, func() (bool, error) {
+		pod, err = cs.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+		if err != nil {
+			// This could be a connection error so we want to retry.
+			klog.ErrorS(err, "Failed to get pod", "pod", klog.KRef(podNamespace, podName))
+			return false, err
+		}
+		return pod.Spec.NodeName != "", nil
 	})
+	return pod, waitErr
 }
 
-func podIsPending(interval time.Duration, times int, cs clientset.Interface, podNamespace, podName string) error {
+func podIsPending(interval time.Duration, times int, cs clientset.Interface, podNamespace, podName string) (*corev1.Pod, error) {
+	var err error
+	var pod *corev1.Pod
 	for attempt := 0; attempt < times; attempt++ {
-		if !podPending(cs, podNamespace, podName) {
-			return fmt.Errorf("pod %s/%s not pending", podNamespace, podName)
+		pod, err = cs.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+		if err != nil {
+			return pod, fmt.Errorf("pod %s/%s not pending: %w", podNamespace, podName, err)
+		}
+		if pod.Spec.NodeName != "" {
+			return pod, fmt.Errorf("pod %s/%s not pending: bound to %q", podNamespace, podName, pod.Spec.NodeName)
 		}
 		time.Sleep(interval)
 	}
-	return nil
+	return pod, nil
 }
 
-// podPending returns true if a node is not assigned to the given pod.
-func podPending(c clientset.Interface, podNamespace, podName string) bool {
-	pod, err := c.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		// This could be a connection error so we want to retry.
-		klog.ErrorS(err, "Failed to get pod", "pod", klog.KRef(podNamespace, podName))
-		return false
-	}
-	return pod.Spec.NodeName == ""
-}
-
-func accumulateResourcesToCapacity(nrt topologyv1alpha1.NodeResourceTopology) corev1.ResourceList {
+func accumulateResourcesToCapacity(nrt topologyv1alpha2.NodeResourceTopology) corev1.ResourceList {
 	resList := corev1.ResourceList{}
 	for _, zone := range nrt.Zones {
 		for _, res := range zone.Resources {
@@ -210,4 +269,47 @@ func resMapToString(resMap map[corev1.ResourceName]string) string {
 		resItems = append(resItems, resName+"="+qty)
 	}
 	return strings.Join(resItems, ",")
+}
+
+func makeTestFullyAvailableNRTSingle() []*topologyv1alpha2.NodeResourceTopology {
+	return []*topologyv1alpha2.NodeResourceTopology{
+		MakeNRT().Name("fake-node-cache-1").Policy(topologyv1alpha2.SingleNUMANodeContainerLevel).
+			Zone(
+				topologyv1alpha2.ResourceInfoList{
+					noderesourcetopology.MakeTopologyResInfo(cpu, "32", "30"),
+					noderesourcetopology.MakeTopologyResInfo(memory, "64Gi", "62Gi"),
+				}).
+			Zone(
+				topologyv1alpha2.ResourceInfoList{
+					noderesourcetopology.MakeTopologyResInfo(cpu, "32", "30"),
+					noderesourcetopology.MakeTopologyResInfo(memory, "64Gi", "62Gi"),
+				}).Obj(),
+	}
+}
+
+func makeTestFullyAvailableNRTs() []*topologyv1alpha2.NodeResourceTopology {
+	nrts := makeTestFullyAvailableNRTSingle()
+	return append(nrts,
+		MakeNRT().Name("fake-node-cache-2").Policy(topologyv1alpha2.SingleNUMANodeContainerLevel).
+			Zone(
+				topologyv1alpha2.ResourceInfoList{
+					noderesourcetopology.MakeTopologyResInfo(cpu, "32", "30"),
+					noderesourcetopology.MakeTopologyResInfo(memory, "64Gi", "62Gi"),
+					noderesourcetopology.MakeTopologyResInfo(nicResourceName, "2", "2"),
+				}).
+			Zone(
+				topologyv1alpha2.ResourceInfoList{
+					noderesourcetopology.MakeTopologyResInfo(cpu, "32", "30"),
+					noderesourcetopology.MakeTopologyResInfo(memory, "64Gi", "62Gi"),
+					noderesourcetopology.MakeTopologyResInfo(nicResourceName, "2", "2"),
+				}).Obj(),
+	)
+}
+
+func formatObject(obj interface{}) string {
+	bytes, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Sprintf("<ERROR: %s>", err)
+	}
+	return string(bytes)
 }

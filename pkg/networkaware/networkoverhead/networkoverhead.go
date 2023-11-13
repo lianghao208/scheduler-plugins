@@ -22,21 +22,22 @@ import (
 	"math"
 	"sort"
 
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	pluginconfig "sigs.k8s.io/scheduler-plugins/apis/config"
-	"sigs.k8s.io/scheduler-plugins/pkg/networkaware/util"
 	networkawareutil "sigs.k8s.io/scheduler-plugins/pkg/networkaware/util"
 
 	agv1alpha1 "github.com/diktyo-io/appgroup-api/pkg/apis/appgroup/v1alpha1"
-	aglisters "github.com/diktyo-io/appgroup-api/pkg/generated/listers/appgroup/v1alpha1"
 	ntv1alpha1 "github.com/diktyo-io/networktopology-api/pkg/apis/networktopology/v1alpha1"
-	ntlisters "github.com/diktyo-io/networktopology-api/pkg/generated/listers/networktopology/v1alpha1"
 )
 
 var _ framework.PreFilterPlugin = &NetworkOverhead{}
@@ -62,10 +63,10 @@ const (
 
 // NetworkOverhead : Filter and Score nodes based on Pod's AppGroup requirements: MaxNetworkCosts requirements among Pods with dependencies
 type NetworkOverhead struct {
-	handle      framework.Handle
+	client.Client
+
 	podLister   corelisters.PodLister
-	agLister    aglisters.AppGroupLister
-	ntLister    ntlisters.NetworkTopologyLister
+	handle      framework.Handle
 	namespaces  []string
 	weightsName string
 	ntName      string
@@ -89,7 +90,7 @@ type PreFilterState struct {
 	dependencyList []agv1alpha1.DependenciesInfo
 
 	// Pods already scheduled based on the dependency list
-	scheduledList util.ScheduledList
+	scheduledList networkawareutil.ScheduledList
 
 	// node map for cost / destinations. Search for requirements faster...
 	nodeCostMap map[string]map[networkawareutil.CostKey]int64
@@ -137,21 +138,25 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 		return nil, err
 	}
 
-	agLister, err := networkawareutil.InitAppGroupInformer(handle.KubeConfig())
-	if err != nil {
-		return nil, err
-	}
+	scheme := runtime.NewScheme()
 
-	ntLister, err := networkawareutil.InitNetworkTopologyInformer(handle.KubeConfig())
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+
+	utilruntime.Must(agv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(ntv1alpha1.AddToScheme(scheme))
+
+	client, err := client.New(handle.KubeConfig(), client.Options{
+		Scheme: scheme,
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	no := &NetworkOverhead{
-		handle:      handle,
+		Client: client,
+
 		podLister:   handle.SharedInformerFactory().Core().V1().Pods().Lister(),
-		agLister:    agLister,
-		ntLister:    ntLister,
+		handle:      handle,
 		namespaces:  args.Namespaces,
 		weightsName: args.WeightsName,
 		ntName:      args.NetworkTopologyName,
@@ -166,7 +171,7 @@ func New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) 
 // 4. Update cost map of all nodes
 // 5. Get number of satisfied and violated dependencies
 // 6. Get final cost of the given node to be used in the score plugin
-func (no *NetworkOverhead) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
+func (no *NetworkOverhead) PreFilter(ctx context.Context, state *framework.CycleState, pod *corev1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	// Init PreFilter State
 	preFilterState := &PreFilterState{
 		scoreEqually: true,
@@ -182,16 +187,10 @@ func (no *NetworkOverhead) PreFilter(ctx context.Context, state *framework.Cycle
 	}
 
 	// Get AppGroup CR
-	appGroup, err := no.findAppGroupNetworkOverhead(agName)
-	if err != nil {
-		return nil, framework.NewStatus(framework.Success, "Error while returning AppGroup, return")
-	}
+	appGroup := no.findAppGroupNetworkOverhead(agName)
 
 	// Get NetworkTopology CR
-	networkTopology, err := no.findNetworkTopologyNetworkOverhead()
-	if err != nil {
-		return nil, framework.NewStatus(framework.Success, "Error while returning NetworkTopology, return")
-	}
+	networkTopology := no.findNetworkTopologyNetworkOverhead()
 
 	// Sort Costs if manual weights were selected
 	no.sortNetworkTopologyCosts(networkTopology)
@@ -212,16 +211,15 @@ func (no *NetworkOverhead) PreFilter(ctx context.Context, state *framework.Cycle
 	}
 
 	// Return if pods are not yet allocated for the AppGroup...
-	if pods == nil {
+	if len(pods) == 0 {
 		return nil, framework.NewStatus(framework.Success, "No pods yet allocated, return")
 	}
 
 	// Pods already scheduled: Get Scheduled List (Deployment name, replicaID, hostname)
 	scheduledList := networkawareutil.GetScheduledList(pods)
-
 	// Check if scheduledList is empty...
-	if scheduledList == nil {
-		klog.ErrorS(err, "Scheduled list is empty, return")
+	if len(scheduledList) == 0 {
+		klog.ErrorS(nil, "Scheduled list is empty, return")
 		return nil, framework.NewStatus(framework.Success, "Scheduled list is empty, return")
 	}
 
@@ -245,7 +243,10 @@ func (no *NetworkOverhead) PreFilter(ctx context.Context, state *framework.Cycle
 		// retrieve region and zone labels
 		region := networkawareutil.GetNodeRegion(nodeInfo.Node())
 		zone := networkawareutil.GetNodeZone(nodeInfo.Node())
-		klog.V(6).InfoS("Node info", "name", nodeInfo.Node().Name, "region", region, "zone", zone)
+		klog.V(6).InfoS("Node info",
+			"name", nodeInfo.Node().Name,
+			"region", region,
+			"zone", zone)
 
 		// Create map for cost / destinations. Search for requirements faster...
 		costMap := make(map[networkawareutil.CostKey]int64)
@@ -302,18 +303,29 @@ func (no *NetworkOverhead) PreFilterExtensions() framework.PreFilterExtensions {
 
 // AddPod from pre-computed data in cycleState.
 // no current need for the NetworkOverhead plugin
-func (no *NetworkOverhead) AddPod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podToAdd *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
+func (no *NetworkOverhead) AddPod(ctx context.Context,
+	cycleState *framework.CycleState,
+	podToSchedule *corev1.Pod,
+	podToAdd *framework.PodInfo,
+	nodeInfo *framework.NodeInfo) *framework.Status {
 	return framework.NewStatus(framework.Success, "")
 }
 
 // RemovePod from pre-computed data in cycleState.
 // no current need for the NetworkOverhead plugin
-func (no *NetworkOverhead) RemovePod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podToRemove *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
+func (no *NetworkOverhead) RemovePod(ctx context.Context,
+	cycleState *framework.CycleState,
+	podToSchedule *corev1.Pod,
+	podToRemove *framework.PodInfo,
+	nodeInfo *framework.NodeInfo) *framework.Status {
 	return framework.NewStatus(framework.Success, "")
 }
 
 // Filter : evaluate if node can respect maxNetworkCost requirements
-func (no *NetworkOverhead) Filter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (no *NetworkOverhead) Filter(ctx context.Context,
+	cycleState *framework.CycleState,
+	pod *corev1.Pod,
+	nodeInfo *framework.NodeInfo) *framework.Status {
 	if nodeInfo.Node() == nil {
 		return framework.NewStatus(framework.Error, "node not found")
 	}
@@ -334,7 +346,7 @@ func (no *NetworkOverhead) Filter(ctx context.Context, cycleState *framework.Cyc
 	// Get satisfied and violated number of dependencies
 	satisfied := preFilterState.satisfiedMap[nodeInfo.Node().Name]
 	violated := preFilterState.violatedMap[nodeInfo.Node().Name]
-	klog.V(6).InfoS("Number of dependencies", "satisfied", satisfied, "violated", violated)
+	klog.V(6).InfoS("Number of dependencies:", "satisfied", satisfied, "violated", violated)
 
 	// The pod is filtered out if the number of violated dependencies is higher than the satisfied ones
 	if violated > satisfied {
@@ -345,14 +357,17 @@ func (no *NetworkOverhead) Filter(ctx context.Context, cycleState *framework.Cyc
 }
 
 // Score : evaluate score for a node
-func (no *NetworkOverhead) Score(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+func (no *NetworkOverhead) Score(ctx context.Context,
+	cycleState *framework.CycleState,
+	pod *corev1.Pod,
+	nodeName string) (int64, *framework.Status) {
 	score := framework.MinNodeScore
 
 	// Get PreFilterState
 	preFilterState, err := getPreFilterState(cycleState)
 	if err != nil {
 		klog.ErrorS(err, "Failed to read preFilterState from cycleState", "preFilterStateKey", preFilterStateKey)
-		return score, framework.NewStatus(framework.Error, fmt.Sprintf("not eligible due to failed to read from cycleState, return min score"))
+		return score, framework.NewStatus(framework.Error, "not eligible due to failed to read from cycleState, return min score")
 	}
 
 	// If scoreEqually, return minScore
@@ -362,13 +377,15 @@ func (no *NetworkOverhead) Score(ctx context.Context, cycleState *framework.Cycl
 
 	// Return Accumulated Cost as score
 	score = preFilterState.finalCostMap[nodeName]
-
-	klog.V(4).InfoS("pod:%s; node:%s; finalScore=%d", pod.GetName(), nodeName, score)
+	klog.V(4).InfoS("Score:", "pod", pod.GetName(), "node", nodeName, "finalScore", score)
 	return score, framework.NewStatus(framework.Success, "Accumulated cost added as score, normalization ensures lower costs are favored")
 }
 
 // NormalizeScore : normalize scores since lower scores correspond to lower latency
-func (no *NetworkOverhead) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+func (no *NetworkOverhead) NormalizeScore(ctx context.Context,
+	state *framework.CycleState,
+	pod *corev1.Pod,
+	scores framework.NodeScoreList) *framework.Status {
 	klog.V(4).InfoS("before normalization: ", "scores", scores)
 
 	// Get Min and Max Scores to normalize between framework.MaxNodeScore and framework.MinNodeScore
@@ -423,7 +440,11 @@ func (no *NetworkOverhead) sortNetworkTopologyCosts(networkTopology *ntv1alpha1.
 }
 
 // populateCostMap : Populates costMap based on the node being filtered/scored
-func (no *NetworkOverhead) populateCostMap(costMap map[networkawareutil.CostKey]int64, networkTopology *ntv1alpha1.NetworkTopology, region string, zone string) {
+func (no *NetworkOverhead) populateCostMap(
+	costMap map[networkawareutil.CostKey]int64,
+	networkTopology *ntv1alpha1.NetworkTopology,
+	region string,
+	zone string) {
 	for _, w := range networkTopology.Spec.Weights { // Check the weights List
 		if w.Name != no.weightsName { // If it is not the Preferred algorithm, continue
 			continue
@@ -471,9 +492,14 @@ func (no *NetworkOverhead) populateCostMap(costMap map[networkawareutil.CostKey]
 }
 
 // checkMaxNetworkCostRequirements : verifies the number of met and unmet dependencies based on the pod being filtered
-func checkMaxNetworkCostRequirements(scheduledList networkawareutil.ScheduledList, dependencyList []agv1alpha1.DependenciesInfo, nodeInfo *framework.NodeInfo, region string,
-	zone string, costMap map[networkawareutil.CostKey]int64, no *NetworkOverhead) (int64, int64, error) {
-
+func checkMaxNetworkCostRequirements(
+	scheduledList networkawareutil.ScheduledList,
+	dependencyList []agv1alpha1.DependenciesInfo,
+	nodeInfo *framework.NodeInfo,
+	region string,
+	zone string,
+	costMap map[networkawareutil.CostKey]int64,
+	no *NetworkOverhead) (int64, int64, error) {
 	var satisfied int64 = 0
 	var violated int64 = 0
 
@@ -541,9 +567,13 @@ func checkMaxNetworkCostRequirements(scheduledList networkawareutil.ScheduledLis
 }
 
 // getAccumulatedCost : calculate the accumulated cost based on the Pod's dependencies
-func (no *NetworkOverhead) getAccumulatedCost(scheduledList networkawareutil.ScheduledList, dependencyList []agv1alpha1.DependenciesInfo, nodeName string, region string,
-	zone string, costMap map[networkawareutil.CostKey]int64) (int64, error) {
-
+func (no *NetworkOverhead) getAccumulatedCost(
+	scheduledList networkawareutil.ScheduledList,
+	dependencyList []agv1alpha1.DependenciesInfo,
+	nodeName string,
+	region string,
+	zone string,
+	costMap map[networkawareutil.CostKey]int64) (int64, error) {
 	// keep track of the accumulated cost
 	var cost int64 = 0
 
@@ -605,7 +635,7 @@ func getPreFilterState(cycleState *framework.CycleState) (*PreFilterState, error
 	no, err := cycleState.Read(preFilterStateKey)
 	if err != nil {
 		// preFilterState doesn't exist, likely PreFilter wasn't invoked.
-		return nil, fmt.Errorf("error reading %q from cycleState: %v", preFilterStateKey, err)
+		return nil, fmt.Errorf("error reading %q from cycleState: %w", preFilterStateKey, err)
 	}
 
 	state, ok := no.(*PreFilterState)
@@ -615,39 +645,44 @@ func getPreFilterState(cycleState *framework.CycleState) (*PreFilterState, error
 	return state, nil
 }
 
-func (no *NetworkOverhead) findAppGroupNetworkOverhead(agName string) (*agv1alpha1.AppGroup, error) {
+func (no *NetworkOverhead) findAppGroupNetworkOverhead(agName string) *agv1alpha1.AppGroup {
 	klog.V(6).InfoS("namespaces: %s", no.namespaces)
-	var err error
 	for _, namespace := range no.namespaces {
-		klog.V(6).InfoS("ag.lister: %v", no.agLister)
-
+		klog.V(6).InfoS("appGroup CR", "namespace", namespace, "name", agName)
 		// AppGroup could not be placed in several namespaces simultaneously
-		appGroup, err := no.agLister.AppGroups(namespace).Get(agName)
+		appGroup := &agv1alpha1.AppGroup{}
+		err := no.Get(context.TODO(), client.ObjectKey{
+			Namespace: namespace,
+			Name:      agName,
+		}, appGroup)
 		if err != nil {
-			klog.V(4).InfoS("Cannot get AppGroup from AppGroupNamespaceLister: %v", err)
+			klog.V(4).ErrorS(err, "Cannot get AppGroup from AppGroupNamespaceLister:")
 			continue
 		}
-		if appGroup != nil {
-			return appGroup, nil
+		if appGroup != nil && appGroup.GetUID() != "" {
+			return appGroup
 		}
 	}
-	return nil, err
+	return nil
 }
 
-func (no *NetworkOverhead) findNetworkTopologyNetworkOverhead() (*ntv1alpha1.NetworkTopology, error) {
+func (no *NetworkOverhead) findNetworkTopologyNetworkOverhead() *ntv1alpha1.NetworkTopology {
 	klog.V(6).InfoS("namespaces: %s", no.namespaces)
-	var err error
 	for _, namespace := range no.namespaces {
-		klog.V(6).InfoS("nt.lister: %v", no.ntLister)
+		klog.V(6).InfoS("networkTopology CR:", "namespace", namespace, "name", no.ntName)
 		// NetworkTopology could not be placed in several namespaces simultaneously
-		networkTopology, err := no.ntLister.NetworkTopologies(namespace).Get(no.ntName)
+		networkTopology := &ntv1alpha1.NetworkTopology{}
+		err := no.Get(context.TODO(), client.ObjectKey{
+			Namespace: namespace,
+			Name:      no.ntName,
+		}, networkTopology)
 		if err != nil {
-			klog.V(4).InfoS("Cannot get networkTopology from networkTopologyNamespaceLister: %v", err)
+			klog.V(4).ErrorS(err, "Cannot get networkTopology from networkTopologyNamespaceLister:")
 			continue
 		}
-		if networkTopology != nil {
-			return networkTopology, nil
+		if networkTopology != nil && networkTopology.GetUID() != "" {
+			return networkTopology
 		}
 	}
-	return nil, err
+	return nil
 }

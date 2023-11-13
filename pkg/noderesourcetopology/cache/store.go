@@ -21,31 +21,30 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/labels"
+	podlisterv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 
-	topologyv1alpha1 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha1"
+	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	topologyv1alpha2attr "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2/helper/attribute"
 
+	apiconfig "sigs.k8s.io/scheduler-plugins/apis/config"
+	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/resourcerequests"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/stringify"
 	"sigs.k8s.io/scheduler-plugins/pkg/util"
 
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 )
 
-var zeroQty resource.Quantity
-
-func init() {
-	zeroQty = resource.MustParse("0")
-}
-
 // nrtStore maps the NRT data by node name. It is not thread safe and needs to be protected by a lock.
 // data is intentionally copied each time it enters and exists the store. E.g, no pointer sharing.
 type nrtStore struct {
-	data map[string]*topologyv1alpha1.NodeResourceTopology
+	data map[string]*topologyv1alpha2.NodeResourceTopology
 }
 
 // newNrtStore creates a new nrtStore and initializes it with copies of the provided Node Resource Topology data.
-func newNrtStore(nrts []*topologyv1alpha1.NodeResourceTopology) *nrtStore {
-	data := make(map[string]*topologyv1alpha1.NodeResourceTopology, len(nrts))
+func newNrtStore(nrts []*topologyv1alpha2.NodeResourceTopology) *nrtStore {
+	data := make(map[string]*topologyv1alpha2.NodeResourceTopology, len(nrts))
 	for _, nrt := range nrts {
 		data[nrt.Name] = nrt.DeepCopy()
 	}
@@ -62,7 +61,7 @@ func (nrs nrtStore) Contains(nodeName string) bool {
 
 // GetNRTCopyByNodeName returns a copy of the stored Node Resource Topology data for the given node,
 // or nil if no data is associated to that node.
-func (nrs *nrtStore) GetNRTCopyByNodeName(nodeName string) *topologyv1alpha1.NodeResourceTopology {
+func (nrs *nrtStore) GetNRTCopyByNodeName(nodeName string) *topologyv1alpha2.NodeResourceTopology {
 	obj, ok := nrs.data[nodeName]
 	if !ok {
 		klog.V(3).InfoS("nrtcache: missing cached NodeTopology", "node", nodeName)
@@ -72,7 +71,7 @@ func (nrs *nrtStore) GetNRTCopyByNodeName(nodeName string) *topologyv1alpha1.Nod
 }
 
 // Update adds or replace the Node Resource Topology associated to a node. Always do a copy.
-func (nrs *nrtStore) Update(nrt *topologyv1alpha1.NodeResourceTopology) {
+func (nrs *nrtStore) Update(nrt *topologyv1alpha2.NodeResourceTopology) {
 	nrs.data[nrt.Name] = nrt.DeepCopy()
 	klog.V(5).InfoS("nrtcache: updated cached NodeTopology", "node", nrt.Name)
 }
@@ -126,7 +125,7 @@ func (rs *resourceStore) DeletePod(pod *corev1.Pod) bool {
 
 // UpdateNRT updates the provided Node Resource Topology object with the resources tracked in this store,
 // performing pessimistic overallocation across all the NUMA zones.
-func (rs *resourceStore) UpdateNRT(logID string, nrt *topologyv1alpha1.NodeResourceTopology) {
+func (rs *resourceStore) UpdateNRT(logID string, nrt *topologyv1alpha2.NodeResourceTopology) {
 	for key, res := range rs.data {
 		// We cannot predict on which Zone the workload will be placed.
 		// And we should totally not guess. So the only safe (and conservative)
@@ -148,7 +147,7 @@ func (rs *resourceStore) UpdateNRT(logID string, nrt *topologyv1alpha1.NodeResou
 					// this should happen rarely, and it is likely caused by
 					// a bug elsewhere.
 					klog.V(3).InfoS("nrtcache: cannot decrement resource", "logID", logID, "zone", zr.Name, "node", nrt.Name, "available", zr.Available, "requestor", key, "quantity", qty)
-					zr.Available = zeroQty
+					zr.Available = resource.Quantity{}
 					continue
 				}
 
@@ -199,32 +198,73 @@ func (cnt counter) Len() int {
 }
 
 // podFingerprintForNodeTopology extracts without recomputing the pods fingerprint from
-// the provided Node Resource Topology object.
-func podFingerprintForNodeTopology(nrt *topologyv1alpha1.NodeResourceTopology) string {
-	if nrt.Annotations == nil {
-		return ""
+// the provided Node Resource Topology object. Returns the expected fingerprint and the method to compute it.
+func podFingerprintForNodeTopology(nrt *topologyv1alpha2.NodeResourceTopology, method apiconfig.CacheResyncMethod) (string, bool) {
+	wantsOnlyExclRes := false
+	if attr, ok := topologyv1alpha2attr.Get(nrt.Attributes, podfingerprint.Attribute); ok {
+		if method == apiconfig.CacheResyncOnlyExclusiveResources {
+			wantsOnlyExclRes = true
+		} else if method == apiconfig.CacheResyncAutodetect {
+			attrMethod, ok := topologyv1alpha2attr.Get(nrt.Attributes, podfingerprint.AttributeMethod)
+			if ok && (attrMethod.Value == podfingerprint.MethodWithExclusiveResources) {
+				wantsOnlyExclRes = true
+			}
+		}
+		return attr.Value, wantsOnlyExclRes
 	}
-	return nrt.Annotations[podfingerprint.Annotation]
+	// with legacy annotations, the exclusive resource method can't ever be true. Just hardcode false.
+	if nrt.Annotations != nil {
+		return nrt.Annotations[podfingerprint.Annotation], false
+	}
+	return "", false
+}
+
+type podData struct {
+	Namespace             string
+	Name                  string
+	HasExclusiveResources bool
 }
 
 // checkPodFingerprintForNode verifies if the given pods fingeprint (usually from NRT update) matches the
 // computed one using the stored data about pods running on nodes. Returns nil on success, or an error
 // describing the failure
-func checkPodFingerprintForNode(logID string, indexer NodeIndexer, nodeName, pfpExpected string) error {
-	objs, err := indexer.GetPodNamespacedNamesByNode(logID, nodeName)
-	if err != nil {
-		return err
-	}
-
-	var st podfingerprint.Status
+func checkPodFingerprintForNode(logID string, objs []podData, nodeName, pfpExpected string, onlyExclRes bool) error {
+	st := podfingerprint.MakeStatus(nodeName)
 	pfp := podfingerprint.NewTracingFingerprint(len(objs), &st)
 	for _, obj := range objs {
+		if onlyExclRes && !obj.HasExclusiveResources {
+			continue
+		}
 		pfp.Add(obj.Namespace, obj.Name)
 	}
 	pfpComputed := pfp.Sign()
 
-	klog.V(5).InfoS("nrtcache: podset fingerprint check", "logID", logID, "node", nodeName, "expected", pfpExpected, "computed", pfpComputed)
+	klog.V(5).InfoS("nrtcache: podset fingerprint check", "logID", logID, "node", nodeName, "expected", pfpExpected, "computed", pfpComputed, "onlyExclusiveResources", onlyExclRes)
 	klog.V(6).InfoS("nrtcache: podset fingerprint debug", "logID", logID, "node", nodeName, "status", st.Repr())
 
-	return pfp.Check(pfpExpected)
+	err := pfp.Check(pfpExpected)
+	podfingerprint.MarkCompleted(st)
+	return err
+}
+
+func makeNodeToPodDataMap(podLister podlisterv1.PodLister, logID string) (map[string][]podData, error) {
+	nodeToObjsMap := make(map[string][]podData)
+	pods, err := podLister.List(labels.Everything())
+	if err != nil {
+		return nodeToObjsMap, err
+	}
+	for _, pod := range pods {
+		if pod.Status.Phase != corev1.PodRunning {
+			// we are interested only about nodes which consume resources
+			continue
+		}
+		nodeObjs := nodeToObjsMap[pod.Spec.NodeName]
+		nodeObjs = append(nodeObjs, podData{
+			Namespace:             pod.Namespace,
+			Name:                  pod.Name,
+			HasExclusiveResources: resourcerequests.AreExclusiveForPod(pod),
+		})
+		nodeToObjsMap[pod.Spec.NodeName] = nodeObjs
+	}
+	return nodeToObjsMap, nil
 }

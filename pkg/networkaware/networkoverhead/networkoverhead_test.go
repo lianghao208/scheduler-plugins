@@ -27,23 +27,23 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	testClientSet "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
-	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	schedruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
 	agv1alpha1 "github.com/diktyo-io/appgroup-api/pkg/apis/appgroup/v1alpha1"
-	agfake "github.com/diktyo-io/appgroup-api/pkg/generated/clientset/versioned/fake"
-	aginformers "github.com/diktyo-io/appgroup-api/pkg/generated/informers/externalversions"
 	ntv1alpha1 "github.com/diktyo-io/networktopology-api/pkg/apis/networktopology/v1alpha1"
-	ntfake "github.com/diktyo-io/networktopology-api/pkg/generated/clientset/versioned/fake"
-	ntinformers "github.com/diktyo-io/networktopology-api/pkg/generated/informers/externalversions"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -53,6 +53,10 @@ type testSharedLister struct {
 	nodes       []*v1.Node
 	nodeInfos   []*framework.NodeInfo
 	nodeInfoMap map[string]*framework.NodeInfo
+}
+
+func (f *testSharedLister) StorageInfos() framework.StorageInfoLister {
+	return nil
 }
 
 func (f *testSharedLister) NodeInfos() framework.NodeInfoLister {
@@ -182,7 +186,11 @@ func GetNetworkTopologyCR() *ntv1alpha1.NetworkTopology {
 func GetNetworkTopologyCRBasic() *ntv1alpha1.NetworkTopology {
 	// Return NetworkTopology CR (basic version): nt-test
 	return &ntv1alpha1.NetworkTopology{
-		ObjectMeta: metav1.ObjectMeta{Name: "nt-test", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nt-test",
+			Namespace: "default",
+			UID:       types.UID("fake-uid"),
+		},
 		Spec: ntv1alpha1.NetworkTopologySpec{
 			Weights: ntv1alpha1.WeightList{
 				ntv1alpha1.WeightInfo{Name: "UserDefined",
@@ -299,7 +307,11 @@ func GetAppGroupCROnlineBoutique() *agv1alpha1.AppGroup {
 func GetAppGroupCRBasic() *agv1alpha1.AppGroup {
 	// Return AppGroup CRD: basic
 	return &agv1alpha1.AppGroup{
-		ObjectMeta: metav1.ObjectMeta{Name: "basic", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "basic",
+			Namespace: "default",
+			UID:       types.UID("fake-uid"),
+		},
 		Spec: agv1alpha1.AppGroupSpec{
 			NumMembers:               3,
 			TopologySortingAlgorithm: "KahnSort",
@@ -476,12 +488,9 @@ func BenchmarkNetworkOverheadPreFilter(b *testing.B) {
 
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
-			// init listers
-			agClient := agfake.NewSimpleClientset()
-			ntClient := ntfake.NewSimpleClientset()
-
-			fakeAgInformer := aginformers.NewSharedInformerFactory(agClient, 0).Appgroup().V1alpha1().AppGroups()
-			fakeNTInformer := ntinformers.NewSharedInformerFactory(ntClient, 0).Networktopology().V1alpha1().NetworkTopologies()
+			s := scheme.Scheme
+			utilruntime.Must(agv1alpha1.AddToScheme(s))
+			utilruntime.Must(ntv1alpha1.AddToScheme(s))
 
 			// init nodes
 			nodes := getNodes(tt.nodesNum, tt.regionNames, tt.zoneNames)
@@ -489,23 +498,26 @@ func BenchmarkNetworkOverheadPreFilter(b *testing.B) {
 			// Create dependencies
 			tt.appGroup.Status.RunningWorkloads = tt.dependenciesNum
 
-			// add CRDs
-			agLister := fakeAgInformer.Lister()
-			ntLister := fakeNTInformer.Lister()
-
-			_ = fakeAgInformer.Informer().GetStore().Add(tt.appGroup)
-			_ = fakeNTInformer.Informer().GetStore().Add(tt.networkTopology)
+			cs := testClientSet.NewSimpleClientset()
+			informerFactory := informers.NewSharedInformerFactory(cs, 0)
+			builder := fake.NewClientBuilder().
+				WithScheme(s).
+				WithObjects(tt.appGroup, tt.networkTopology).
+				WithStatusSubresource(&agv1alpha1.AppGroup{}).
+				WithStatusSubresource(&ntv1alpha1.NetworkTopology{})
+			for _, p := range tt.pods {
+				builder.WithObjects(p.DeepCopy())
+			}
+			client := builder.Build()
 
 			// create plugin
 			ctx := context.Background()
-			cs := testClientSet.NewSimpleClientset()
-
-			informerFactory := informers.NewSharedInformerFactory(cs, 0)
 
 			snapshot := newTestSharedLister(nil, nodes)
 
 			podInformer := informerFactory.Core().V1().Pods()
 			podLister := podInformer.Lister()
+
 			informerFactory.Start(ctx.Done())
 
 			for _, p := range tt.pods {
@@ -520,14 +532,13 @@ func BenchmarkNetworkOverheadPreFilter(b *testing.B) {
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 			}
 
-			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", runtime.WithClientSet(cs),
-				runtime.WithInformerFactory(informerFactory), runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", ctx.Done(), schedruntime.WithClientSet(cs),
+				schedruntime.WithInformerFactory(informerFactory), schedruntime.WithSnapshotSharedLister(snapshot))
 
 			pl := &NetworkOverhead{
-				handle:      fh,
-				agLister:    agLister,
+				Client:      client,
 				podLister:   podLister,
-				ntLister:    ntLister,
+				handle:      fh,
 				namespaces:  []string{"default"},
 				weightsName: "UserDefined",
 				ntName:      "nt-test",
@@ -545,7 +556,7 @@ func BenchmarkNetworkOverheadPreFilter(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				// Prefilter
-				if _, got := pl.PreFilter(nil, state, tt.pod); got.Code() != tt.expected {
+				if _, got := pl.PreFilter(context.TODO(), state, tt.pod); got.Code() != tt.expected {
 					b.Errorf("expected %v, got %v : %v", tt.expected, got.Code(), got.Message())
 					assert.True(b, got.IsSuccess())
 				}
@@ -705,29 +716,28 @@ func TestNetworkOverheadScore(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// init listers
-			agClient := agfake.NewSimpleClientset()
-			ntClient := ntfake.NewSimpleClientset()
-
-			fakeAgInformer := aginformers.NewSharedInformerFactory(agClient, 0).Appgroup().V1alpha1().AppGroups()
-			fakeNTInformer := ntinformers.NewSharedInformerFactory(ntClient, 0).Networktopology().V1alpha1().NetworkTopologies()
-
-			// add CRDs
-			_ = fakeAgInformer.Informer().GetStore().Add(tt.appGroup)
-			_ = fakeNTInformer.Informer().GetStore().Add(tt.networkTopology)
-
-			agLister := fakeAgInformer.Lister()
-			ntLister := fakeNTInformer.Lister()
+			s := scheme.Scheme
+			utilruntime.Must(agv1alpha1.AddToScheme(s))
+			utilruntime.Must(ntv1alpha1.AddToScheme(s))
 
 			ctx := context.Background()
 			cs := testClientSet.NewSimpleClientset()
+			builder := fake.NewClientBuilder().
+				WithScheme(s).
+				WithObjects(tt.appGroup, tt.networkTopology).
+				WithStatusSubresource(&agv1alpha1.AppGroup{}).
+				WithStatusSubresource(&ntv1alpha1.NetworkTopology{})
+			for _, p := range tt.pods {
+				builder.WithObjects(p.DeepCopy())
+			}
+			client := builder.Build()
 
 			informerFactory := informers.NewSharedInformerFactory(cs, 0)
-
 			snapshot := newTestSharedLister(nil, tt.nodes)
 
 			podInformer := informerFactory.Core().V1().Pods()
 			podLister := podInformer.Lister()
+
 			informerFactory.Start(ctx.Done())
 
 			for _, p := range tt.pods {
@@ -742,14 +752,13 @@ func TestNetworkOverheadScore(t *testing.T) {
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 			}
 
-			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", runtime.WithClientSet(cs),
-				runtime.WithInformerFactory(informerFactory), runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", ctx.Done(), schedruntime.WithClientSet(cs),
+				schedruntime.WithInformerFactory(informerFactory), schedruntime.WithSnapshotSharedLister(snapshot))
 
 			pl := &NetworkOverhead{
-				handle:      fh,
-				agLister:    agLister,
+				Client:      client,
 				podLister:   podLister,
-				ntLister:    ntLister,
+				handle:      fh,
 				namespaces:  []string{"default"},
 				weightsName: "UserDefined",
 				ntName:      "nt-test",
@@ -767,7 +776,7 @@ func TestNetworkOverheadScore(t *testing.T) {
 
 			for _, n := range nodes {
 				// Prefilter
-				if _, got := pl.PreFilter(nil, state, tt.pod); got.Code() != tt.expected {
+				if _, got := pl.PreFilter(ctx, state, tt.pod); got.Code() != tt.expected {
 					t.Errorf("expected %v, got %v : %v", tt.expected, got.Code(), got.Message())
 				}
 
@@ -947,12 +956,9 @@ func BenchmarkNetworkOverheadScore(b *testing.B) {
 
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
-			// init listers
-			agClient := agfake.NewSimpleClientset()
-			ntClient := ntfake.NewSimpleClientset()
-
-			fakeAgInformer := aginformers.NewSharedInformerFactory(agClient, 0).Appgroup().V1alpha1().AppGroups()
-			fakeNTInformer := ntinformers.NewSharedInformerFactory(ntClient, 0).Networktopology().V1alpha1().NetworkTopologies()
+			s := scheme.Scheme
+			utilruntime.Must(agv1alpha1.AddToScheme(s))
+			utilruntime.Must(ntv1alpha1.AddToScheme(s))
 
 			// init nodes
 			nodes := getNodes(tt.nodesNum, tt.regionNames, tt.zoneNames)
@@ -960,23 +966,25 @@ func BenchmarkNetworkOverheadScore(b *testing.B) {
 			// Create dependencies
 			tt.appGroup.Status.RunningWorkloads = tt.dependenciesNum
 
-			// add CRDs
-			agLister := fakeAgInformer.Lister()
-			ntLister := fakeNTInformer.Lister()
-
-			_ = fakeAgInformer.Informer().GetStore().Add(tt.appGroup)
-			_ = fakeNTInformer.Informer().GetStore().Add(tt.networkTopology)
-
 			// create plugin
 			ctx := context.Background()
 			cs := testClientSet.NewSimpleClientset()
+			builder := fake.NewClientBuilder().
+				WithScheme(s).
+				WithStatusSubresource(&agv1alpha1.AppGroup{}).
+				WithStatusSubresource(&ntv1alpha1.NetworkTopology{}).
+				WithObjects(tt.appGroup, tt.networkTopology)
+			for _, p := range tt.pods {
+				builder.WithObjects(p.DeepCopy())
+			}
+			client := builder.Build()
 
 			informerFactory := informers.NewSharedInformerFactory(cs, 0)
 
 			snapshot := newTestSharedLister(nil, nodes)
-
 			podInformer := informerFactory.Core().V1().Pods()
 			podLister := podInformer.Lister()
+
 			informerFactory.Start(ctx.Done())
 
 			for _, p := range tt.pods {
@@ -991,14 +999,13 @@ func BenchmarkNetworkOverheadScore(b *testing.B) {
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 			}
 
-			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", runtime.WithClientSet(cs),
-				runtime.WithInformerFactory(informerFactory), runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", ctx.Done(), schedruntime.WithClientSet(cs),
+				schedruntime.WithInformerFactory(informerFactory), schedruntime.WithSnapshotSharedLister(snapshot))
 
 			pl := &NetworkOverhead{
-				handle:      fh,
-				agLister:    agLister,
+				Client:      client,
 				podLister:   podLister,
-				ntLister:    ntLister,
+				handle:      fh,
 				namespaces:  []string{"default"},
 				weightsName: "UserDefined",
 				ntName:      "nt-test",
@@ -1014,7 +1021,7 @@ func BenchmarkNetworkOverheadScore(b *testing.B) {
 			}
 
 			// Prefilter
-			if _, got := pl.PreFilter(nil, state, tt.pod); got.Code() != tt.expected {
+			if _, got := pl.PreFilter(context.TODO(), state, tt.pod); got.Code() != tt.expected {
 				b.Errorf("expected %v, got %v : %v", tt.expected, got.Code(), got.Message())
 			}
 
@@ -1090,7 +1097,7 @@ func TestNetworkOverheadFilter(t *testing.T) {
 			networkTopology: networkTopology,
 			pod:             makePod("p1", "p1-deployment", 0, "basic", nil, nil),
 			nodes:           nodes,
-			wantStatus:      framework.NewStatus(framework.Unschedulable, fmt.Sprintf("Node n-1 does not meet several network requirements from Workload dependencies: Satisfied: 0 Violated: 1")),
+			wantStatus:      framework.NewStatus(framework.Unschedulable, "Node n-1 does not meet several network requirements from Workload dependencies: Satisfied: 0 Violated: 1"),
 			nodeToFilter:    nodes[0],
 			pods:            pods,
 			expected:        framework.Success,
@@ -1114,7 +1121,7 @@ func TestNetworkOverheadFilter(t *testing.T) {
 			networkTopology: networkTopology,
 			pod:             makePod("p2", "p2-deployment", 0, "basic", nil, nil),
 			nodes:           nodes,
-			wantStatus:      framework.NewStatus(framework.Unschedulable, fmt.Sprintf("Node n-5 does not meet several network requirements from Workload dependencies: Satisfied: 0 Violated: 1")),
+			wantStatus:      framework.NewStatus(framework.Unschedulable, "Node n-5 does not meet several network requirements from Workload dependencies: Satisfied: 0 Violated: 1"),
 			nodeToFilter:    nodes[4],
 			pods:            pods,
 			expected:        framework.Success,
@@ -1162,7 +1169,7 @@ func TestNetworkOverheadFilter(t *testing.T) {
 			networkTopology: networkTopology,
 			pod:             makePod("p1", "p1-deployment", 0, "basic", nil, nil),
 			nodes:           nodes,
-			wantStatus:      framework.NewStatus(framework.Unschedulable, fmt.Sprintf("Node n-1 does not meet several network requirements from Workload dependencies: Satisfied: 0 Violated: 1")),
+			wantStatus:      framework.NewStatus(framework.Unschedulable, "Node n-1 does not meet several network requirements from Workload dependencies: Satisfied: 0 Violated: 1"),
 			nodeToFilter:    nodes[0],
 			pods:            pods,
 			expected:        framework.Success,
@@ -1182,23 +1189,23 @@ func TestNetworkOverheadFilter(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// init listers
-			agClient := agfake.NewSimpleClientset()
-			ntClient := ntfake.NewSimpleClientset()
-
-			fakeAgInformer := aginformers.NewSharedInformerFactory(agClient, 0).Appgroup().V1alpha1().AppGroups()
-			fakeNTInformer := ntinformers.NewSharedInformerFactory(ntClient, 0).Networktopology().V1alpha1().NetworkTopologies()
-
-			// add CRDs
-			fakeAgInformer.Informer().GetStore().Add(tt.appGroup)
-			fakeNTInformer.Informer().GetStore().Add(tt.networkTopology)
-
-			agLister := fakeAgInformer.Lister()
-			ntLister := fakeNTInformer.Lister()
+			s := scheme.Scheme
+			utilruntime.Must(agv1alpha1.AddToScheme(s))
+			utilruntime.Must(ntv1alpha1.AddToScheme(s))
 
 			// create plugin
 			ctx := context.Background()
 			cs := testClientSet.NewSimpleClientset()
+
+			builder := fake.NewClientBuilder().
+				WithScheme(s).
+				WithStatusSubresource(&agv1alpha1.AppGroup{}).
+				WithStatusSubresource(&ntv1alpha1.NetworkTopology{}).
+				WithObjects(tt.appGroup, tt.networkTopology)
+			for _, p := range tt.pods {
+				builder.WithObjects(p.DeepCopy())
+			}
+			client := builder.Build()
 
 			informerFactory := informers.NewSharedInformerFactory(cs, 0)
 
@@ -1206,6 +1213,7 @@ func TestNetworkOverheadFilter(t *testing.T) {
 
 			podInformer := informerFactory.Core().V1().Pods()
 			podLister := podInformer.Lister()
+
 			informerFactory.Start(ctx.Done())
 
 			for _, p := range tt.pods {
@@ -1220,14 +1228,15 @@ func TestNetworkOverheadFilter(t *testing.T) {
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 			}
 
-			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", runtime.WithClientSet(cs),
-				runtime.WithInformerFactory(informerFactory), runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", ctx.Done(),
+				schedruntime.WithClientSet(cs),
+				schedruntime.WithInformerFactory(informerFactory),
+				schedruntime.WithSnapshotSharedLister(snapshot))
 
 			pl := &NetworkOverhead{
-				handle:      fh,
-				agLister:    agLister,
+				Client:      client,
 				podLister:   podLister,
-				ntLister:    ntLister,
+				handle:      fh,
 				namespaces:  []string{"default"},
 				weightsName: "UserDefined",
 				ntName:      "nt-test",
@@ -1243,7 +1252,7 @@ func TestNetworkOverheadFilter(t *testing.T) {
 			state := framework.NewCycleState()
 
 			// Prefilter
-			if _, got := pl.PreFilter(nil, state, tt.pod); got.Code() != tt.expected {
+			if _, got := pl.PreFilter(context.TODO(), state, tt.pod); got.Code() != tt.expected {
 				t.Errorf("expected %v, got %v : %v", tt.expected, got.Code(), got.Message())
 			}
 
@@ -1404,26 +1413,25 @@ func BenchmarkNetworkOverheadFilter(b *testing.B) {
 
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
-			// init listers
-			agClient := agfake.NewSimpleClientset()
-			ntClient := ntfake.NewSimpleClientset()
-
-			fakeAgInformer := aginformers.NewSharedInformerFactory(agClient, 0).Appgroup().V1alpha1().AppGroups()
-			fakeNTInformer := ntinformers.NewSharedInformerFactory(ntClient, 0).Networktopology().V1alpha1().NetworkTopologies()
+			s := scheme.Scheme
+			utilruntime.Must(agv1alpha1.AddToScheme(s))
+			utilruntime.Must(ntv1alpha1.AddToScheme(s))
 
 			// init nodes
 			nodes := getNodes(tt.nodesNum, tt.regionNames, tt.zoneNames)
 
-			// add CRDs
-			agLister := fakeAgInformer.Lister()
-			ntLister := fakeNTInformer.Lister()
-
-			_ = fakeAgInformer.Informer().GetStore().Add(tt.appGroup)
-			_ = fakeNTInformer.Informer().GetStore().Add(tt.networkTopology)
-
 			// create plugin
 			ctx := context.Background()
 			cs := testClientSet.NewSimpleClientset()
+			builder := fake.NewClientBuilder().
+				WithScheme(s).
+				WithStatusSubresource(&agv1alpha1.AppGroup{}).
+				WithStatusSubresource(&ntv1alpha1.NetworkTopology{}).
+				WithObjects(tt.appGroup, tt.networkTopology)
+			for _, p := range tt.pods {
+				builder.WithObjects(p.DeepCopy())
+			}
+			client := builder.Build()
 
 			informerFactory := informers.NewSharedInformerFactory(cs, 0)
 
@@ -1439,7 +1447,6 @@ func BenchmarkNetworkOverheadFilter(b *testing.B) {
 				if err != nil {
 					b.Fatalf("Failed to create Workload %q: %v", p.Name, err)
 				}
-				//b.Logf("Workload %v created  \n", p.Name)
 			}
 
 			registeredPlugins := []st.RegisterPluginFunc{
@@ -1447,14 +1454,15 @@ func BenchmarkNetworkOverheadFilter(b *testing.B) {
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 			}
 
-			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", runtime.WithClientSet(cs),
-				runtime.WithInformerFactory(informerFactory), runtime.WithSnapshotSharedLister(snapshot))
+			fh, _ := st.NewFramework(registeredPlugins, "default-scheduler", ctx.Done(),
+				schedruntime.WithClientSet(cs),
+				schedruntime.WithInformerFactory(informerFactory),
+				schedruntime.WithSnapshotSharedLister(snapshot))
 
 			pl := &NetworkOverhead{
-				handle:      fh,
-				agLister:    agLister,
+				Client:      client,
 				podLister:   podLister,
-				ntLister:    ntLister,
+				handle:      fh,
 				namespaces:  []string{"default"},
 				weightsName: "UserDefined",
 				ntName:      "nt-test",
@@ -1470,7 +1478,7 @@ func BenchmarkNetworkOverheadFilter(b *testing.B) {
 			state := framework.NewCycleState()
 
 			// Prefilter
-			if _, got := pl.PreFilter(nil, state, tt.pod); got.Code() != tt.expected {
+			if _, got := pl.PreFilter(context.TODO(), state, tt.pod); got.Code() != tt.expected {
 				b.Errorf("expected %v, got %v : %v", tt.expected, got.Code(), got.Message())
 			}
 
@@ -1607,15 +1615,4 @@ func makePodAllocated(selector string, podName string, hostname string, priority
 			},
 		},
 	}
-}
-
-// podScheduled returns true if a node is assigned to the given pod.
-func podScheduled(c *testClientSet.Clientset, podNamespace, podName string) bool {
-	pod, err := c.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		// This could be a connection error so we want to retry.
-		klog.ErrorS(err, "Failed to get pod", "pod", klog.KRef(podNamespace, podName))
-		return false
-	}
-	return pod.Spec.NodeName != ""
 }
