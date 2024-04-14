@@ -141,23 +141,23 @@ any vanilla Kubernetes scheduling capability. Instead, a lot of extra out-of-box
     
     ```diff
     16d15
-    <     - --config=/etc/kubernetes/sched-cc.yaml
+    +     - --config=/etc/kubernetes/sched-cc.yaml
     17a17,18
-    >     - --kubeconfig=/etc/kubernetes/scheduler.conf
-    >     - --leader-elect=true
+    -     - --kubeconfig=/etc/kubernetes/scheduler.conf
+    -     - --leader-elect=true
     19,20c20
-    <     image: registry.k8s.io/scheduler-plugins/kube-scheduler:v0.27.8
+    +     image: registry.k8s.io/scheduler-plugins/kube-scheduler:v0.27.8
     ---
-    >     image: registry.k8s.io/kube-scheduler:v1.27.8
+    -     image: registry.k8s.io/kube-scheduler:v1.27.8
     50,52d49
-    <     - mountPath: /etc/kubernetes/sched-cc.yaml
-    <       name: sched-cc
-    <       readOnly: true
+    +     - mountPath: /etc/kubernetes/sched-cc.yaml
+    +       name: sched-cc
+    +       readOnly: true
     60,63d56
-    <   - hostPath:
-    <       path: /etc/kubernetes/sched-cc.yaml
-    <       type: FileOrCreate
-    <     name: sched-cc
+    +   - hostPath:
+    +       path: /etc/kubernetes/sched-cc.yaml
+    +       type: FileOrCreate
+    +     name: sched-cc
     ```
    
 1. Verify that kube-scheduler pod is running properly with a correct image: `registry.k8s.io/scheduler-plugins/kube-scheduler:v0.27.8`
@@ -233,7 +233,7 @@ Now, we're able to verify how the coscheduling plugin works.
 1. As PodGroup `pg1` requires at least 3 pods to be scheduled all-together, and there are only 2 Pods
    so far, so it's expected to observer they are pending:
 
-    All nginx pods are expected to be `Pending` as they cannot be co-scheduled altogether.
+    All pods are expected to be `Pending` as they cannot be co-scheduled altogether.
 
     ```bash
     $ kubectl get pod

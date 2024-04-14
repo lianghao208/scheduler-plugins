@@ -18,11 +18,11 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"sort"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 
@@ -35,6 +35,7 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	apiconfig "sigs.k8s.io/scheduler-plugins/apis/config"
+	"sigs.k8s.io/scheduler-plugins/pkg/noderesourcetopology/podprovider"
 	tu "sigs.k8s.io/scheduler-plugins/test/util"
 )
 
@@ -103,12 +104,12 @@ func TestInitEmptyLister(t *testing.T) {
 
 	fakePodLister := &fakePodLister{}
 
-	_, err = NewOverReserve(nil, nil, fakePodLister)
+	_, err = NewOverReserve(nil, nil, fakePodLister, podprovider.IsPodRelevantAlways)
 	if err == nil {
 		t.Fatalf("accepted nil lister")
 	}
 
-	_, err = NewOverReserve(nil, fakeClient, nil)
+	_, err = NewOverReserve(nil, fakeClient, nil, podprovider.IsPodRelevantAlways)
 	if err == nil {
 		t.Fatalf("accepted nil indexer")
 	}
@@ -207,57 +208,30 @@ func TestDirtyNodesUnmarkedOnReserve(t *testing.T) {
 	}
 }
 
-func TestGetCachedNRTCopy(t *testing.T) {
-	fakeClient, err := tu.NewFakeClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestOverreserveGetCachedNRTCopy(t *testing.T) {
+	testNodeName := "worker-node-1"
+	nrt := makeTestNRT(testNodeName)
 
-	fakePodLister := &fakePodLister{}
-
-	nrtCache := mustOverReserve(t, fakeClient, fakePodLister)
-
-	ctx := context.Background()
-	var nrtObj *topologyv1alpha2.NodeResourceTopology
-	nrtObj, _ = nrtCache.GetCachedNRTCopy(ctx, "node1", &corev1.Pod{})
-	if nrtObj != nil {
-		t.Fatalf("non-empty object from empty cache")
-	}
-
-	nodeTopologies := []*topologyv1alpha2.NodeResourceTopology{
+	testCases := []testCaseGetCachedNRTCopy{
 		{
-			ObjectMeta:       metav1.ObjectMeta{Name: "node1"},
-			TopologyPolicies: []string{string(topologyv1alpha2.SingleNUMANodeContainerLevel)},
-			Zones: topologyv1alpha2.ZoneList{
-				{
-					Name: "node-0",
-					Type: "Node",
-					Resources: topologyv1alpha2.ResourceInfoList{
-						MakeTopologyResInfo(cpu, "20", "4"),
-						MakeTopologyResInfo(memory, "8Gi", "8Gi"),
-						MakeTopologyResInfo(nicResourceName, "30", "10"),
-					},
-				},
-				{
-					Name: "node-1",
-					Type: "Node",
-					Resources: topologyv1alpha2.ResourceInfoList{
-						MakeTopologyResInfo(cpu, "30", "8"),
-						MakeTopologyResInfo(memory, "8Gi", "8Gi"),
-						MakeTopologyResInfo(nicResourceName, "30", "10"),
-					},
-				},
+			name: "data present with foreign pods",
+			nodeTopologies: []*topologyv1alpha2.NodeResourceTopology{
+				nrt,
 			},
+			nodeName:       testNodeName,
+			hasForeignPods: true,
+			expectedNRT:    nil,
+			expectedOK:     false,
 		},
 	}
-	for _, obj := range nodeTopologies {
-		nrtCache.Store().Update(obj)
-	}
 
-	nrtObj, _ = nrtCache.GetCachedNRTCopy(ctx, "node1", &corev1.Pod{})
-	if !reflect.DeepEqual(nrtObj, nodeTopologies[0]) {
-		t.Fatalf("unexpected object from cache\ngot: %s\nexpected: %s\n", dumpNRT(nrtObj), dumpNRT(nodeTopologies[0]))
-	}
+	checkGetCachedNRTCopy(
+		t,
+		func(client ctrlclient.Client, podLister podlisterv1.PodLister) (Interface, error) {
+			return NewOverReserve(nil, client, podLister, podprovider.IsPodRelevantAlways)
+		},
+		testCases...,
+	)
 }
 
 func TestGetCachedNRTCopyReserve(t *testing.T) {
@@ -751,55 +725,248 @@ func TestNodeWithForeignPods(t *testing.T) {
 	}
 }
 
-func dumpNRT(nrtObj *topologyv1alpha2.NodeResourceTopology) string {
-	nrtJson, err := json.MarshalIndent(nrtObj, "", " ")
+func mustOverReserve(t *testing.T, client ctrlclient.Client, podLister podlisterv1.PodLister) *OverReserve {
+	obj, err := NewOverReserve(nil, client, podLister, podprovider.IsPodRelevantAlways)
 	if err != nil {
-		return "marshallingError"
+		t.Fatalf("unexpected error creating cache: %v", err)
 	}
-	return string(nrtJson)
+	return obj
 }
 
-func MakeTopologyResInfo(name, capacity, available string) topologyv1alpha2.ResourceInfo {
-	return topologyv1alpha2.ResourceInfo{
-		Name:      name,
-		Capacity:  resource.MustParse(capacity),
-		Available: resource.MustParse(available),
-	}
-}
-
-func makeDefaultTestTopology() []*topologyv1alpha2.NodeResourceTopology {
-	return []*topologyv1alpha2.NodeResourceTopology{
+func TestMakeNodeToPodDataMap(t *testing.T) {
+	tcases := []struct {
+		description   string
+		pods          []*corev1.Pod
+		isPodRelevant podprovider.PodFilterFunc
+		err           error
+		expected      map[string][]podData
+		expectedErr   error
+	}{
 		{
-			ObjectMeta:       metav1.ObjectMeta{Name: "node1"},
-			TopologyPolicies: []string{string(topologyv1alpha2.SingleNUMANodeContainerLevel)},
-			Zones: topologyv1alpha2.ZoneList{
+			description:   "empty pod list - shared",
+			isPodRelevant: podprovider.IsPodRelevantShared,
+			expected:      make(map[string][]podData),
+		},
+		{
+			description:   "empty pod list - dedicated",
+			isPodRelevant: podprovider.IsPodRelevantDedicated,
+			expected:      make(map[string][]podData),
+		},
+		{
+			description: "single pod NOT running - succeeded (kubernetes jobs) - dedicated",
+			pods: []*corev1.Pod{
 				{
-					Name: "node-0",
-					Type: "Node",
-					Resources: topologyv1alpha2.ResourceInfoList{
-						MakeTopologyResInfo(cpu, "32", "30"),
-						MakeTopologyResInfo(memory, "64Gi", "60Gi"),
-						MakeTopologyResInfo(nicResourceName, "16", "16"),
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodSucceeded,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantDedicated,
+			expected: map[string][]podData{
+				"node1": {
+					{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+				},
+			},
+		},
+		{
+			description: "single pod NOT running - failed",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodFailed,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantDedicated,
+			expected: map[string][]podData{
+				"node1": {
+					{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+				},
+			},
+		},
+		{
+			description: "single pod NOT running - succeeded (kubernetes jobs) - shared",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodSucceeded,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantShared,
+			expected:      map[string][]podData{},
+		},
+		{
+			description: "single pod NOT running - failed - shared",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodFailed,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantShared,
+			expected:      map[string][]podData{},
+		},
+		{
+			description: "single pod running - dedicated",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantDedicated,
+			expected: map[string][]podData{
+				"node1": {
+					{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+				},
+			},
+		},
+		{
+			description: "single pod running - shared",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantDedicated,
+			expected: map[string][]podData{
+				"node1": {
+					{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+				},
+			},
+		},
+		{
+			description: "few pods, single node running - dedicated",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
 					},
 				},
 				{
-					Name: "node-1",
-					Type: "Node",
-					Resources: topologyv1alpha2.ResourceInfoList{
-						MakeTopologyResInfo(cpu, "32", "30"),
-						MakeTopologyResInfo(memory, "64Gi", "60Gi"),
-						MakeTopologyResInfo(nicResourceName, "16", "16"),
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace2",
+						Name:      "pod2",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "namespace2",
+						Name:      "pod3",
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node1",
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+			},
+			isPodRelevant: podprovider.IsPodRelevantDedicated,
+			expected: map[string][]podData{
+				"node1": {
+					{
+						Namespace: "namespace1",
+						Name:      "pod1",
+					},
+					{
+						Namespace: "namespace2",
+						Name:      "pod2",
+					},
+					{
+						Namespace: "namespace2",
+						Name:      "pod3",
 					},
 				},
 			},
 		},
 	}
-}
 
-func mustOverReserve(t *testing.T, client ctrlclient.Client, podLister podlisterv1.PodLister) *OverReserve {
-	obj, err := NewOverReserve(nil, client, podLister)
-	if err != nil {
-		t.Fatalf("unexpected error creating cache: %v", err)
+	for _, tcase := range tcases {
+		t.Run(tcase.description, func(t *testing.T) {
+			podLister := &fakePodLister{
+				pods: tcase.pods,
+				err:  tcase.err,
+			}
+			got, err := makeNodeToPodDataMap(podLister, tcase.isPodRelevant, tcase.description)
+			if err != tcase.expectedErr {
+				t.Errorf("error mismatch: got %v expected %v", err, tcase.expectedErr)
+			}
+			if diff := cmp.Diff(got, tcase.expected); diff != "" {
+				t.Errorf("unexpected result: %v", diff)
+			}
+		})
 	}
-	return obj
 }
